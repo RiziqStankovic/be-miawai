@@ -91,36 +91,39 @@ func (s *Server) devLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Email string `json:"email"`
-		Name  string `json:"name"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
 
-	email := strings.TrimSpace(body.Email)
-	if email == "" {
-		email = "demo@miaw.local"
-	}
-
-	name := strings.TrimSpace(body.Name)
-	if name == "" {
-		name = "Miaw Demo"
+	account, ok := lookupDevAccount(body.Email)
+	if !ok || account.Password != body.Password {
+		writeError(w, http.StatusUnauthorized, "invalid dev credentials")
+		return
 	}
 
 	user, err := s.store.FindOrCreateOAuthUser(r.Context(), models.OAuthProfile{
 		Provider:       "dev",
-		ProviderUserID: email,
-		Email:          email,
-		Name:           name,
+		ProviderUserID: account.Email,
+		Email:          account.Email,
+		Name:           account.Name,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create dev session")
 		return
 	}
 
-	if err := s.sessions.SetSession(w, user.ID); err != nil {
+	user = decorateUserAccess(user)
+
+	if err := s.sessions.SetSession(w, auth.SessionIdentity{
+		UserID: user.ID,
+		Email:  user.Email,
+		Role:   user.Role,
+		Access: user.Access,
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create session")
 		return
 	}
@@ -171,7 +174,14 @@ func (s *Server) oauthCallback(provider string) http.HandlerFunc {
 			return
 		}
 
-		if err := s.sessions.SetSession(w, user.ID); err != nil {
+		user = decorateUserAccess(user)
+
+		if err := s.sessions.SetSession(w, auth.SessionIdentity{
+			UserID: user.ID,
+			Email:  user.Email,
+			Role:   user.Role,
+			Access: user.Access,
+		}); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create session")
 			return
 		}
@@ -190,16 +200,26 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request, user models.User) {
 }
 
 func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request, user models.User) {
-	settings, err := s.loadRuntimeSettings(r.Context(), user.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load runtime settings")
-		return
+	settings := models.RuntimeSettings{
+		Models: models.RuntimeModels{All: []string{}},
+	}
+	if hasAccess(user, accessRuntimeRead) {
+		var err error
+		settings, err = s.loadRuntimeSettings(r.Context(), user.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to load runtime settings")
+			return
+		}
 	}
 
-	conversations, err := s.store.ListConversationsByUser(r.Context(), user.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load conversations")
-		return
+	conversations := []models.Conversation{}
+	if hasAccess(user, accessConversationsRead) {
+		var err error
+		conversations, err = s.store.ListConversationsByUser(r.Context(), user.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to load conversations")
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -210,6 +230,11 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request, user models.U
 }
 
 func (s *Server) runtimeSettings(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessRuntimeRead) {
+		writeError(w, http.StatusForbidden, "runtime access is not allowed for this role")
+		return
+	}
+
 	settings, err := s.loadRuntimeSettings(r.Context(), user.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load runtime settings")
@@ -220,6 +245,11 @@ func (s *Server) runtimeSettings(w http.ResponseWriter, r *http.Request, user mo
 }
 
 func (s *Server) updateRuntimeSettings(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessRuntimeWrite) {
+		writeError(w, http.StatusForbidden, "runtime editing is not allowed for this role")
+		return
+	}
+
 	var body struct {
 		Provider     string   `json:"provider"`
 		BaseURL      string   `json:"baseUrl"`
@@ -252,6 +282,11 @@ func (s *Server) updateRuntimeSettings(w http.ResponseWriter, r *http.Request, u
 }
 
 func (s *Server) testRuntimeSettings(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessRuntimeWrite) {
+		writeError(w, http.StatusForbidden, "runtime editing is not allowed for this role")
+		return
+	}
+
 	var body struct {
 		Provider    string   `json:"provider"`
 		BaseURL     string   `json:"baseUrl"`
@@ -284,6 +319,11 @@ func (s *Server) testRuntimeSettings(w http.ResponseWriter, r *http.Request, use
 }
 
 func (s *Server) listConversations(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessConversationsRead) {
+		writeError(w, http.StatusForbidden, "conversation history is not allowed for this role")
+		return
+	}
+
 	conversations, err := s.store.ListConversationsByUser(r.Context(), user.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load conversations")
@@ -294,6 +334,11 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request, user 
 }
 
 func (s *Server) getConversation(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessConversationsRead) || !hasAccess(user, accessChatRead) {
+		writeError(w, http.StatusForbidden, "conversation history is not allowed for this role")
+		return
+	}
+
 	conversationID := r.PathValue("id")
 	messages, err := s.store.ListConversationMessages(r.Context(), user.ID, conversationID)
 	if err != nil {
@@ -322,6 +367,11 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request, user mo
 }
 
 func (s *Server) updateConversation(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessConversationsWrite) {
+		writeError(w, http.StatusForbidden, "conversation updates are not allowed for this role")
+		return
+	}
+
 	conversationID := r.PathValue("id")
 	var body struct {
 		Title  *string `json:"title"`
@@ -346,6 +396,11 @@ func (s *Server) updateConversation(w http.ResponseWriter, r *http.Request, user
 }
 
 func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessConversationsDelete) {
+		writeError(w, http.StatusForbidden, "conversation deletion is not allowed for this role")
+		return
+	}
+
 	conversationID := r.PathValue("id")
 	if err := s.store.DeleteConversation(r.Context(), user.ID, conversationID); err != nil {
 		if database.IsNotFound(err) {
@@ -360,6 +415,11 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request, user
 }
 
 func (s *Server) chatHistory(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessChatRead) {
+		writeError(w, http.StatusForbidden, "chat history is not allowed for this role")
+		return
+	}
+
 	messages, err := s.store.ListChatMessagesByUser(r.Context(), user.ID, 100)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load chat history")
@@ -370,6 +430,11 @@ func (s *Server) chatHistory(w http.ResponseWriter, r *http.Request, user models
 }
 
 func (s *Server) chat(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessChatWrite) {
+		writeError(w, http.StatusForbidden, "chat sending is not allowed for this role")
+		return
+	}
+
 	var body struct {
 		Message string `json:"message"`
 	}
@@ -399,6 +464,15 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request, user models.User) 
 }
 
 func (s *Server) chatStream(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessChatWrite) {
+		writeError(w, http.StatusForbidden, "chat sending is not allowed for this role")
+		return
+	}
+	if !hasAccess(user, accessConversationsWrite) {
+		writeError(w, http.StatusForbidden, "conversation updates are not allowed for this role")
+		return
+	}
+
 	var body struct {
 		ConversationID string `json:"conversationId"`
 		Title          string `json:"title"`
@@ -662,6 +736,11 @@ func (s *Server) guestChatStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) platformSubscription(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessBillingWrite) {
+		writeError(w, http.StatusForbidden, "billing updates are not allowed for this role")
+		return
+	}
+
 	var body struct {
 		Platform         string          `json:"platform"`
 		ProductID        string          `json:"productId"`
@@ -732,18 +811,19 @@ func (s *Server) requireUser(next func(http.ResponseWriter, *http.Request, model
 			return
 		}
 
-		userID, err := s.sessions.ParseSession(cookie.Value)
+		identity, err := s.sessions.ParseSession(cookie.Value)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, "invalid session")
 			return
 		}
 
-		user, err := s.store.GetUserByID(r.Context(), userID)
+		user, err := s.store.GetUserByID(r.Context(), identity.UserID)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, "user not found")
 			return
 		}
 
+		user = applySessionAccess(user, identity)
 		next(w, r, user)
 	}
 }

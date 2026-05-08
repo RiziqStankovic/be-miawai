@@ -8,6 +8,8 @@ type User struct {
 	Name               string     `json:"name"`
 	AvatarURL          string     `json:"avatarUrl"`
 	Plan               string     `json:"plan"`
+	Role               string     `json:"role"`
+	Access             []string   `json:"access"`
 	SubscriptionStatus string     `json:"subscriptionStatus"`
 	EntitledUntil      *time.Time `json:"entitledUntil"`
 	CreatedAt          time.Time  `json:"createdAt"`
