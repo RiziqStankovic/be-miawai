@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,15 +36,18 @@ import (
 )
 
 type Server struct {
-	cfg            config.Config
-	store          *database.Store
-	sessions       *auth.Manager
-	guests         *auth.GuestManager
-	client         *http.Client
-	aiClient       *ai.Client
-	research       *research.Client
-	chatStorage    storage.CloudStorage
-	memoryWorkerMu sync.Mutex
+	cfg             config.Config
+	store           *database.Store
+	sessions        *auth.Manager
+	guests          *auth.GuestManager
+	client          *http.Client
+	aiClient        *ai.Client
+	research        *research.Client
+	chatStorage     storage.CloudStorage
+	memoryWorkerMu  sync.Mutex
+	chatGuardMu     sync.Mutex
+	lastChatByUser  map[string]time.Time
+	whatsAppRefresh func(context.Context, string) error
 }
 
 type errorResponse struct {
@@ -66,10 +70,15 @@ func NewServer(cfg config.Config, store *database.Store) *Server {
 			TargetPages:     cfg.WebResearchTargetPages,
 			MaxContentChars: cfg.WebResearchMaxContentChars,
 		}),
-		chatStorage: storage.NewLocalCloudStorage("storage/chats"),
+		chatStorage:    storage.NewLocalCloudStorage("storage/chats"),
+		lastChatByUser: make(map[string]time.Time),
 	}
 	server.startMemoryExtractionWorker()
 	return server
+}
+
+func (s *Server) SetWhatsAppPairingRefresher(refresh func(context.Context, string) error) {
+	s.whatsAppRefresh = refresh
 }
 
 func (s *Server) Routes() http.Handler {
@@ -95,8 +104,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/whatsapp/accounts", s.requireUser(s.listWhatsAppAccounts))
 	mux.HandleFunc("POST /v1/whatsapp/accounts", s.requireUser(s.createWhatsAppAccount))
 	mux.HandleFunc("PATCH /v1/whatsapp/accounts/{id}", s.requireUser(s.updateWhatsAppAccount))
+	mux.HandleFunc("POST /v1/whatsapp/accounts/{id}/pairing-refresh", s.requireUser(s.refreshWhatsAppPairing))
 	mux.HandleFunc("DELETE /v1/whatsapp/accounts/{id}", s.requireUser(s.deleteWhatsAppAccount))
 	mux.HandleFunc("POST /v1/whatsapp/link-codes", s.requireUser(s.createWhatsAppLinkCode))
+	mux.HandleFunc("GET /v1/admin/overview", s.requireUser(s.adminOverview))
 	mux.HandleFunc("GET /v1/admin/whatsapp/conversations", s.requireUser(s.adminWhatsAppConversations))
 	mux.HandleFunc("GET /v1/admin/whatsapp/conversations/{id}", s.requireUser(s.adminWhatsAppConversation))
 	mux.HandleFunc("GET /v1/admin/whatsapp/events", s.requireUser(s.adminWhatsAppEvents))
@@ -127,17 +138,83 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/chat/stream", s.requireUser(s.chatStream))
 	mux.HandleFunc("GET /v1/uploads/{id}", s.requireUser(s.serveUpload))
 	mux.HandleFunc("GET /v1/subscriptions/entitlement", s.requireUser(s.me))
+	mux.HandleFunc("POST /v1/subscriptions/trial", s.requireUser(s.startTrial))
 	mux.HandleFunc("POST /v1/subscriptions/platform", s.requireUser(s.platformSubscription))
 	mux.HandleFunc("POST /v1/webhooks/subscriptions", s.subscriptionWebhook)
 	mux.HandleFunc("POST /v1/webhooks/midtrans", s.midtransWebhook)
 	mux.HandleFunc("POST /v1/checkout/create", s.requireUser(s.createCheckout))
 	mux.HandleFunc("POST /v1/checkout/sync", s.requireUser(s.syncCheckout))
 	mux.HandleFunc("POST /v1/subscriptions/verify-android", s.requireUser(s.verifyAndroidPurchase))
-	return mux
+	return s.withRequestLogging(mux)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessAdmin) {
+		writeError(w, http.StatusForbidden, "admin access is required")
+		return
+	}
+
+	windowDays := 7
+	if raw := strings.TrimSpace(r.URL.Query().Get("days")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 90 {
+			writeError(w, http.StatusBadRequest, "days must be between 1 and 90")
+			return
+		}
+		windowDays = parsed
+	}
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 200 {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 200")
+			return
+		}
+		limit = parsed
+	}
+
+	since := time.Now().Add(-time.Duration(windowDays) * 24 * time.Hour)
+	overview, err := s.store.GetAdminOverview(r.Context(), since, limit)
+	if err != nil {
+		log.Printf("admin overview failed user_id=%s err=%v", user.ID, err)
+		writeError(w, http.StatusInternalServerError, "failed to load admin overview")
+		return
+	}
+
+	type usageRow struct {
+		models.AdminUserUsage
+		EstimatedCostUSD float64 `json:"estimatedCostUsd"`
+	}
+	usage := make([]usageRow, 0, len(overview.UsageByUser))
+	for _, item := range overview.UsageByUser {
+		cost := tokenCostUSD(item.TokenInput+item.TokenOutput, s.cfg.AICostUSDPer1KTokens)
+		usage = append(usage, usageRow{AdminUserUsage: item, EstimatedCostUSD: cost})
+	}
+	totalCost := tokenCostUSD(overview.TotalTokenInput+overview.TotalTokenOutput, s.cfg.AICostUSDPer1KTokens)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"windowDays":           windowDays,
+		"generatedAt":          time.Now(),
+		"totalUsers":           overview.TotalUsers,
+		"activeSubscriptions":  overview.ActiveSubscriptions,
+		"trialSubscriptions":   overview.TrialSubscriptions,
+		"paymentTotalAmount":   overview.PaymentTotalAmount,
+		"totalPromptCount":     overview.TotalPromptCount,
+		"totalImageCount":      overview.TotalImageCount,
+		"totalResearchCount":   overview.TotalResearchCount,
+		"totalTokenInput":      overview.TotalTokenInput,
+		"totalTokenOutput":     overview.TotalTokenOutput,
+		"estimatedCostUsd":     totalCost,
+		"usageByUser":          usage,
+		"recentPayments":       overview.RecentPayments,
+		"costUsdPer1KTokens":   s.cfg.AICostUSDPer1KTokens,
+		"webResearchDailyFree": s.cfg.FreeUserDailyWebResearchLimit,
+		"webResearchDailyPro":  s.cfg.ProUserDailyWebResearchLimit,
+	})
 }
 
 func (s *Server) guestSession(w http.ResponseWriter, r *http.Request) {
@@ -232,16 +309,6 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to register account")
 		return
 	}
-	if err := s.store.StartTrialSubscription(r.Context(), user.ID, 72*time.Hour); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to start trial")
-		return
-	}
-	user, err = s.store.GetUserByID(r.Context(), user.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load account")
-		return
-	}
-
 	s.writeUserSession(w, decorateUserAccess(user))
 }
 
@@ -284,6 +351,27 @@ func (s *Server) writeUserSession(w http.ResponseWriter, user models.User) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]models.User{"user": user})
+}
+
+func (s *Server) startTrial(w http.ResponseWriter, r *http.Request, user models.User) {
+	if strings.EqualFold(user.SubscriptionStatus, "active") || strings.EqualFold(user.SubscriptionStatus, "trialing") {
+		writeError(w, http.StatusConflict, "Pro access is already active")
+		return
+	}
+	if err := s.store.StartTrialSubscription(r.Context(), user.ID, 72*time.Hour); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "trial already used") {
+			writeError(w, http.StatusConflict, "trial already used")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to start trial")
+		return
+	}
+	updated, err := s.store.GetUserByID(r.Context(), user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load account")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]models.User{"user": decorateUserAccess(updated)})
 }
 
 func (s *Server) oauthLogin(provider string) http.HandlerFunc {
@@ -560,7 +648,7 @@ func (s *Server) usageStatus(w http.ResponseWriter, r *http.Request, user models
 	fiveHourLimit := periodicTokenLimitForUser(s.cfg, user, "5h")
 	weeklyLimit := periodicTokenLimitForUser(s.cfg, user, "week")
 	weeklyTokenUsage := weeklyUsage.TokenInput + weeklyUsage.TokenOutput
-	credits := buildUsageCreditStatus(s.cfg.ProUserIncludedCreditUSD, weeklyTokenUsage, s.cfg.AICostUSDPer1KTokens)
+	credits := buildUsageCreditStatus(includedCreditUSDForUser(s.cfg, user), weeklyTokenUsage, s.cfg.AICostUSDPer1KTokens)
 	plan := strings.ToLower(firstNonEmpty(user.Plan, "free"))
 	if plan == "pro" && user.SubscriptionStatus == "trialing" {
 		plan = "pro_trial"
@@ -597,13 +685,20 @@ func (s *Server) researchSearch(w http.ResponseWriter, r *http.Request, user mod
 		writeError(w, http.StatusBadRequest, "query is required")
 		return
 	}
+	if _, err := s.checkUserQuota(r.Context(), user, 0, true); err != nil {
+		writeError(w, http.StatusPaymentRequired, err.Error())
+		return
+	}
 	startedAt := time.Now()
 	log.Printf("research search start user=%s query=%q", user.ID, logValue(query, 160))
 	report, err := s.research.SearchAndRead(r.Context(), query)
 	if err != nil {
 		log.Printf("research search failed user=%s query=%q durationMs=%d error=%q", user.ID, logValue(query, 160), time.Since(startedAt).Milliseconds(), err.Error())
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeError(w, http.StatusBadGateway, "web research is temporarily unavailable")
 		return
+	}
+	if err := s.store.IncrementDailyUsage(r.Context(), user.ID, 0, 0, 0, 1); err != nil {
+		log.Printf("research usage tracking failed user=%s error=%q", user.ID, err.Error())
 	}
 	log.Printf("research search done user=%s query=%q results=%d pages=%d warnings=%d durationMs=%d", user.ID, logValue(query, 160), len(report.Results), len(report.Pages), len(report.Warnings), time.Since(startedAt).Milliseconds())
 	writeJSON(w, http.StatusOK, map[string]research.Report{"report": report})
@@ -630,13 +725,20 @@ func (s *Server) researchReadURL(w http.ResponseWriter, r *http.Request, user mo
 		writeError(w, http.StatusBadRequest, "web research is disabled")
 		return
 	}
+	if _, err := s.checkUserQuota(r.Context(), user, 0, true); err != nil {
+		writeError(w, http.StatusPaymentRequired, err.Error())
+		return
+	}
 	startedAt := time.Now()
 	log.Printf("research read-url start user=%s url=%q", user.ID, logValue(rawURL, 220))
 	page, err := s.research.ReadURL(r.Context(), rawURL)
 	if err != nil {
 		log.Printf("research read-url failed user=%s url=%q durationMs=%d error=%q", user.ID, logValue(rawURL, 220), time.Since(startedAt).Milliseconds(), err.Error())
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeError(w, http.StatusBadGateway, "web research is temporarily unavailable")
 		return
+	}
+	if err := s.store.IncrementDailyUsage(r.Context(), user.ID, 0, 0, 0, 1); err != nil {
+		log.Printf("research usage tracking failed user=%s error=%q", user.ID, err.Error())
 	}
 	log.Printf("research read-url done user=%s url=%q finalUrl=%q status=%d chars=%d durationMs=%d", user.ID, logValue(rawURL, 220), logValue(page.FinalURL, 220), page.Status, len(page.TextPreview), time.Since(startedAt).Milliseconds())
 	writeJSON(w, http.StatusOK, map[string]research.Report{"report": research.Report{
@@ -928,8 +1030,16 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request, user models.
 		writeError(w, http.StatusBadRequest, "message or image is required")
 		return
 	}
+	if s.cfg.MaxPromptChars > 0 && len([]rune(message)) > s.cfg.MaxPromptChars {
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("message is too long, maximum %d characters", s.cfg.MaxPromptChars))
+		return
+	}
 	if len(body.Images) > 4 {
 		writeError(w, http.StatusBadRequest, "maximum 4 images per message")
+		return
+	}
+	if err := s.checkPromptSpam(user.ID); err != nil {
+		writeError(w, http.StatusTooManyRequests, err.Error())
 		return
 	}
 
@@ -1543,10 +1653,15 @@ func (s *Server) createCheckout(w http.ResponseWriter, r *http.Request, user mod
 
 	orderID := "MIAW-" + database.NewID("ord")
 	midtrans := payment.MidtransService{Config: s.cfg}
+	if strings.TrimSpace(s.cfg.MidtransClientKey) == "" {
+		writeError(w, http.StatusServiceUnavailable, "payment popup is not configured")
+		return
+	}
 	returnURL := s.cfg.AppBaseURL + "/workspace?checkout=midtrans&order_id=" + url.QueryEscape(orderID)
 	snapResp, err := midtrans.CreateSnapTransaction(orderID, body.ProductID, amount, user.Email, user.Name, returnURL)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create checkout: "+err.Error())
+		log.Printf("create checkout failed: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "payment is not available yet")
 		return
 	}
 
@@ -1572,6 +1687,8 @@ func (s *Server) createCheckout(w http.ResponseWriter, r *http.Request, user mod
 		"currency":    "IDR",
 		"token":       snapResp.Token,
 		"redirectUrl": snapResp.RedirectURL,
+		"snapJsUrl":   midtrans.SnapJSScriptURL(),
+		"clientKey":   s.cfg.MidtransClientKey,
 	})
 }
 
@@ -1606,7 +1723,8 @@ func (s *Server) syncCheckout(w http.ResponseWriter, r *http.Request, user model
 	midtrans := payment.MidtransService{Config: s.cfg}
 	statusResp, err := midtrans.GetTransactionStatus(orderID)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "failed to sync checkout: "+err.Error())
+		log.Printf("sync checkout failed orderID=%s: %v", orderID, err)
+		writeError(w, http.StatusBadGateway, "failed to sync payment status")
 		return
 	}
 
@@ -2000,6 +2118,82 @@ func validSignature(secret string, payload []byte, signature string) bool {
 	mac.Write(payload)
 	expected := hex.EncodeToString(mac.Sum(nil))
 	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(payload []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(payload)
+}
+
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (s *Server) withRequestLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+		if requestID == "" {
+			requestID = database.NewID("req")
+		}
+		w.Header().Set("X-Request-ID", requestID)
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Printf("request panic request_id=%s method=%s path=%s err=%v", requestID, r.Method, r.URL.Path, recovered)
+				writeError(recorder, http.StatusInternalServerError, "unexpected server error")
+			}
+			log.Printf(
+				"request request_id=%s method=%s path=%s status=%d duration_ms=%d remote=%s ua=%q",
+				requestID,
+				r.Method,
+				r.URL.Path,
+				recorder.status,
+				time.Since(start).Milliseconds(),
+				r.RemoteAddr,
+				r.UserAgent(),
+			)
+		}()
+
+		next.ServeHTTP(recorder, r)
+	})
+}
+
+func (s *Server) checkPromptSpam(userID string) error {
+	if s.cfg.MinChatIntervalMs <= 0 {
+		return nil
+	}
+	now := time.Now()
+	minInterval := time.Duration(s.cfg.MinChatIntervalMs) * time.Millisecond
+	s.chatGuardMu.Lock()
+	defer s.chatGuardMu.Unlock()
+	if previous, ok := s.lastChatByUser[userID]; ok && now.Sub(previous) < minInterval {
+		return fmt.Errorf("please wait %.1f seconds before sending another message", minInterval.Seconds())
+	}
+	s.lastChatByUser[userID] = now
+	return nil
+}
+
+func tokenCostUSD(tokens int, costPer1K float64) float64 {
+	if tokens <= 0 || costPer1K <= 0 {
+		return 0
+	}
+	return roundCurrency((float64(tokens) / 1000) * costPer1K)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -2612,6 +2806,13 @@ func periodicTokenLimitForUser(cfg config.Config, user models.User, window strin
 	return cfg.FreeUserFiveHourTokenLimit
 }
 
+func includedCreditUSDForUser(cfg config.Config, user models.User) float64 {
+	if user.Plan == "pro" {
+		return cfg.ProUserIncludedCreditUSD
+	}
+	return cfg.FreeUserIncludedCreditUSD
+}
+
 func buildUsageWindowStatus(id string, label string, used int, limit int, resetAt time.Time) usageWindowStatus {
 	remaining := 0
 	percentLeft := 100
@@ -2642,18 +2843,19 @@ func buildUsageCreditStatus(initialCreditUSD float64, usedTokens int, costUSDPer
 	}
 }
 
-func (s *Server) hasRemainingWeeklyUsageCredit(ctx context.Context, userID string) (bool, error) {
-	if s.cfg.ProUserIncludedCreditUSD <= 0 || s.cfg.AICostUSDPer1KTokens <= 0 {
+func (s *Server) hasRemainingWeeklyUsageCredit(ctx context.Context, user models.User) (bool, error) {
+	includedCreditUSD := includedCreditUSDForUser(s.cfg, user)
+	if includedCreditUSD <= 0 || s.cfg.AICostUSDPer1KTokens <= 0 {
 		return true, nil
 	}
 	now := time.Now().In(wibLocation())
 	weekStart, _ := currentWeeklyUsageWindow(now)
-	weeklyUsage, err := s.store.GetUsageWindow(ctx, userID, weekStart)
+	weeklyUsage, err := s.store.GetUsageWindow(ctx, user.ID, weekStart)
 	if err != nil {
 		return false, err
 	}
 	weeklyTokenUsage := weeklyUsage.TokenInput + weeklyUsage.TokenOutput
-	credits := buildUsageCreditStatus(s.cfg.ProUserIncludedCreditUSD, weeklyTokenUsage, s.cfg.AICostUSDPer1KTokens)
+	credits := buildUsageCreditStatus(includedCreditUSD, weeklyTokenUsage, s.cfg.AICostUSDPer1KTokens)
 	return credits.Remaining > 0, nil
 }
 

@@ -30,6 +30,8 @@ type Config struct {
 	// Subscription & Payments
 	MidtransServerKey            string
 	MidtransClientKey            string
+	MidtransBaseURL              string
+	MidtransSnapBaseURL          string
 	MidtransIsProduction         bool
 	GooglePlayServiceAccountJSON string
 	GooglePlayPackageName        string
@@ -45,11 +47,14 @@ type Config struct {
 	ProUserFiveHourTokenLimit     int
 	FreeUserWeeklyTokenLimit      int
 	ProUserWeeklyTokenLimit       int
+	FreeUserIncludedCreditUSD     float64
 	ProUserIncludedCreditUSD      float64
 	AICostUSDPer1KTokens          float64
 	ManagedAIApiKey               string
 	ChatContextMessageLimit       int
 	ChatContextCharLimit          int
+	MaxPromptChars                int
+	MinChatIntervalMs             int
 
 	// Web research
 	WebResearchEnabled         bool
@@ -95,8 +100,10 @@ func Load() Config {
 		GitHubClientSecret:        os.Getenv("GITHUB_CLIENT_SECRET"),
 		SubscriptionWebhookSecret: getenv("SUBSCRIPTION_WEBHOOK_SECRET", "dev-webhook-secret"),
 
-		MidtransServerKey:            os.Getenv("MIDTRANS_SERVER_KEY"),
-		MidtransClientKey:            os.Getenv("MIDTRANS_CLIENT_KEY"),
+		MidtransServerKey:            firstNonEmpty(os.Getenv("MIDTRANS_SERVER_KEY"), os.Getenv("midtrans_server_key")),
+		MidtransClientKey:            firstNonEmpty(os.Getenv("MIDTRANS_CLIENT_KEY"), os.Getenv("midtrans_client_key")),
+		MidtransBaseURL:              strings.TrimRight(firstNonEmpty(os.Getenv("MIDTRANS_BASE_URL"), os.Getenv("midtrans_base_url")), "/"),
+		MidtransSnapBaseURL:          strings.TrimRight(firstNonEmpty(os.Getenv("MIDTRANS_SNAP_BASE_URL"), os.Getenv("midtrans_snap_base_url")), "/"),
 		MidtransIsProduction:         getenv("MIDTRANS_IS_PRODUCTION", "false") == "true",
 		GooglePlayServiceAccountJSON: os.Getenv("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"),
 		GooglePlayPackageName:        getenv("GOOGLE_PLAY_PACKAGE_NAME", "id.cloudfren.miaw.dynamicisland"),
@@ -111,11 +118,14 @@ func Load() Config {
 		ProUserFiveHourTokenLimit:     parseInt(getenv("PRO_USER_5H_TOKEN_LIMIT", "500000"), 500000),
 		FreeUserWeeklyTokenLimit:      parseInt(getenv("FREE_USER_WEEKLY_TOKEN_LIMIT", "200000"), 200000),
 		ProUserWeeklyTokenLimit:       parseInt(getenv("PRO_USER_WEEKLY_TOKEN_LIMIT", "2000000"), 2000000),
+		FreeUserIncludedCreditUSD:     parseFloat(getenv("FREE_USER_INCLUDED_CREDIT_USD", "0.5"), 0.5),
 		ProUserIncludedCreditUSD:      parseFloat(getenv("PRO_USER_INCLUDED_CREDIT_USD", "5"), 5),
 		AICostUSDPer1KTokens:          parseFloat(getenv("AI_COST_USD_PER_1K_TOKENS", "0.002"), 0.002),
 		ManagedAIApiKey:               os.Getenv("MANAGED_AI_API_KEY"),
 		ChatContextMessageLimit:       parseInt(getenv("CHAT_CONTEXT_MESSAGE_LIMIT", "24"), 24),
 		ChatContextCharLimit:          parseInt(getenv("CHAT_CONTEXT_CHAR_LIMIT", "24000"), 24000),
+		MaxPromptChars:                parseInt(getenv("MAX_PROMPT_CHARS", "12000"), 12000),
+		MinChatIntervalMs:             parseInt(getenv("MIN_CHAT_INTERVAL_MS", "1200"), 1200),
 
 		WebResearchEnabled:         getenv("WEB_RESEARCH_ENABLED", "false") == "true",
 		SearxngURL:                 strings.TrimRight(getenv("SEARXNG_URL", "http://127.0.0.1:25017"), "/"),
@@ -152,6 +162,9 @@ func loadDotEnv(path string) {
 		}
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
+			key, value, ok = strings.Cut(line, ":")
+		}
+		if !ok {
 			continue
 		}
 		key = strings.TrimSpace(key)
@@ -169,11 +182,20 @@ func getenv(key string, fallback string) string {
 	return fallback
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 func splitCSV(value string) []string {
 	parts := strings.Split(value, ",")
 	out := make([]string, 0, len(parts))
 	for _, part := range parts {
-		if trimmed := strings.TrimSpace(part); trimmed != "" {
+		if trimmed := strings.TrimRight(strings.TrimSpace(part), "/"); trimmed != "" {
 			out = append(out, trimmed)
 		}
 	}

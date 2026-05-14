@@ -50,6 +50,7 @@ func main() {
 		ListenGroups: cfg.WhatsAppListenGroups,
 		SessionDB:    cfg.WhatsAppSessionDB,
 	}, api)
+	api.SetWhatsAppPairingRefresher(waRunner.RefreshPairing)
 	if err := waRunner.Start(ctx); err != nil {
 		log.Fatalf("start whatsapp: %v", err)
 	}

@@ -157,6 +157,18 @@ func (s *Store) StartTrialSubscription(ctx context.Context, userID string, durat
 	if duration <= 0 {
 		duration = 72 * time.Hour
 	}
+	var existingID string
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id FROM subscriptions WHERE user_id = $1 AND product_id = 'miaw_pro_trial_3d' LIMIT 1`,
+		userID,
+	).Scan(&existingID)
+	if err == nil {
+		return errors.New("trial already used")
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	entitledUntil := time.Now().UTC().Add(duration)
 	return s.UpsertSubscription(
 		ctx,
@@ -227,7 +239,6 @@ func (s *Store) FindOrCreateOAuthUser(ctx context.Context, profile models.OAuthP
 		return models.User{}, err
 	}
 
-	createdUser := false
 	if errors.Is(err, sql.ErrNoRows) {
 		err = tx.QueryRowContext(ctx, `SELECT id FROM users WHERE email = $1`, profile.Email).Scan(&userID)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -240,7 +251,6 @@ func (s *Store) FindOrCreateOAuthUser(ctx context.Context, profile models.OAuthP
 				profile.Name,
 				profile.AvatarURL,
 			)
-			createdUser = true
 		}
 		if err != nil {
 			return models.User{}, err
@@ -276,39 +286,6 @@ func (s *Store) FindOrCreateOAuthUser(ctx context.Context, profile models.OAuthP
 	)
 	if err != nil {
 		return models.User{}, err
-	}
-
-	if createdUser && profile.Provider != "dev" {
-		entitledUntil := time.Now().UTC().Add(72 * time.Hour)
-		_, err = tx.ExecContext(
-			ctx,
-			`INSERT INTO subscriptions (id, user_id, platform, product_id, status, current_period_end, raw_payload)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			newID("sub"),
-			userID,
-			"miaw",
-			"miaw_pro_trial_3d",
-			"trialing",
-			entitledUntil,
-			json.RawMessage(`{"source":"oauth","trialDays":3}`),
-		)
-		if err != nil {
-			return models.User{}, err
-		}
-		_, err = tx.ExecContext(
-			ctx,
-			`UPDATE users
-			 SET plan = 'pro',
-			     subscription_status = 'trialing',
-			     entitled_until = $2,
-			     updated_at = NOW()
-			 WHERE id = $1`,
-			userID,
-			entitledUntil,
-		)
-		if err != nil {
-			return models.User{}, err
-		}
 	}
 
 	user, err := scanUser(tx.QueryRowContext(ctx, userSelectSQL()+` WHERE id = $1`, userID))

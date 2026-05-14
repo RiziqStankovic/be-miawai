@@ -120,6 +120,42 @@ func (s *Server) updateWhatsAppAccount(w http.ResponseWriter, r *http.Request, u
 	writeJSON(w, http.StatusOK, map[string]models.WhatsAppAccount{"account": account})
 }
 
+func (s *Server) refreshWhatsAppPairing(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessWhatsAppWrite) {
+		writeError(w, http.StatusForbidden, "whatsapp pairing refresh is not allowed for this role")
+		return
+	}
+	accountID := strings.TrimSpace(r.PathValue("id"))
+	account, err := s.store.GetWhatsAppAccountByID(r.Context(), accountID)
+	if err != nil {
+		if database.IsNotFound(err) {
+			writeError(w, http.StatusNotFound, "whatsapp account not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load whatsapp account")
+		return
+	}
+	if account.OwnerUserID != user.ID && !hasAccess(user, accessAdmin) {
+		writeError(w, http.StatusForbidden, "whatsapp account does not belong to this user")
+		return
+	}
+	if s.whatsAppRefresh == nil {
+		writeError(w, http.StatusServiceUnavailable, "whatsapp runner is not available")
+		return
+	}
+	if err := s.whatsAppRefresh(r.Context(), account.ID); err != nil {
+		log.Printf("refresh whatsapp pairing account=%s failed: %v", account.ID, err)
+		writeError(w, http.StatusServiceUnavailable, "failed to refresh whatsapp pairing")
+		return
+	}
+	refreshed, err := s.store.GetWhatsAppAccountByID(r.Context(), account.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to refresh whatsapp account")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]models.WhatsAppAccount{"account": refreshed})
+}
+
 func (s *Server) createWhatsAppLinkCode(w http.ResponseWriter, r *http.Request, user models.User) {
 	if !hasAccess(user, accessWhatsAppWrite) {
 		writeError(w, http.StatusForbidden, "whatsapp linking is not allowed for this role")
@@ -561,7 +597,7 @@ func (s *Server) processWhatsAppMessage(ctx context.Context, user models.User, a
 }
 
 func (s *Server) checkUserQuota(ctx context.Context, user models.User, imageCount int, webRequested bool) (bool, error) {
-	hasCredit, err := s.hasRemainingWeeklyUsageCredit(ctx, user.ID)
+	hasCredit, err := s.hasRemainingWeeklyUsageCredit(ctx, user)
 	if err != nil {
 		return false, err
 	}
@@ -580,13 +616,10 @@ func (s *Server) checkUserQuota(ctx context.Context, user models.User, imageCoun
 		if s.cfg.FreeUserDailyImageLimit > 0 && usage.ImageCount+imageCount > s.cfg.FreeUserDailyImageLimit {
 			return false, errors.New("free user daily image limit reached")
 		}
-		if webRequested && s.cfg.FreeUserDailyWebResearchLimit <= 0 {
+		if webRequested {
 			return false, errors.New("web research is available on pro")
 		}
-		if s.cfg.FreeUserDailyWebResearchLimit > 0 && usage.ResearchCount >= s.cfg.FreeUserDailyWebResearchLimit {
-			return false, errors.New("free user daily web research limit reached")
-		}
-		return s.cfg.FreeUserDailyWebResearchLimit > 0, nil
+		return false, nil
 	}
 	if s.cfg.ProUserDailyPromptLimit > 0 && usage.PromptCount >= s.cfg.ProUserDailyPromptLimit {
 		return false, errors.New("pro user daily chat limit reached")

@@ -45,6 +45,7 @@ type Runner struct {
 	account models.WhatsAppAccount
 	db      *sql.DB
 	client  *whatsmeow.Client
+	mu      sync.Mutex
 
 	healthMu      sync.Mutex
 	healthCancel  context.CancelFunc
@@ -58,6 +59,12 @@ func NewRunner(cfg Config, backend Backend) *Runner {
 }
 
 func (r *Runner) Start(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.startLocked(context.Background())
+}
+
+func (r *Runner) startLocked(ctx context.Context) error {
 	if !r.cfg.Enabled {
 		log.Printf("whatsapp embedded disabled")
 		return nil
@@ -71,10 +78,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	}
 	r.account = account
 
-	sessionDB := strings.TrimSpace(r.cfg.SessionDB)
-	if sessionDB == "" {
-		sessionDB = "data/whatsapp.db"
-	}
+	sessionDB := r.sessionDBPath()
 	if err := os.MkdirAll(filepath.Dir(sessionDB), 0o755); err != nil {
 		return err
 	}
@@ -118,19 +122,55 @@ func (r *Runner) Start(ctx context.Context) error {
 }
 
 func (r *Runner) Stop(ctx context.Context) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stopLocked(ctx)
+}
+
+func (r *Runner) stopLocked(ctx context.Context) {
 	if r.healthCancel != nil {
 		r.healthCancel()
+		r.healthCancel = nil
 	}
 	if r.client != nil {
 		r.client.Disconnect()
 		r.reportStatus(ctx, "disconnected")
 		r.markHealth("disconnected", false)
+		r.client = nil
 	}
 	if r.db != nil {
 		if err := r.db.Close(); err != nil {
 			log.Printf("close whatsapp db: %v", err)
 		}
+		r.db = nil
 	}
+}
+
+func (r *Runner) RefreshPairing(ctx context.Context, accountID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.cfg.Enabled {
+		return errors.New("whatsapp embedded disabled")
+	}
+	if r.account.ID != "" && r.account.ID != accountID {
+		return errors.New("whatsapp account is not managed by this runner")
+	}
+
+	r.stopLocked(ctx)
+	if err := removeWhatsAppSessionDB(r.sessionDBPath()); err != nil {
+		return err
+	}
+	r.account.QRCode = ""
+	r.account.PhoneJID = ""
+	r.account.Status = "pending_qr"
+	if _, err := r.backend.UpdateWhatsAppStatus(ctx, handlers.WhatsAppStatusInput{
+		AccountID: accountID,
+		Status:    "pending_qr",
+	}); err != nil {
+		return err
+	}
+	return r.startLocked(ctx)
 }
 
 func openWhatsAppDB(path string) (*sql.DB, error) {
@@ -148,6 +188,23 @@ func openWhatsAppDB(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+func (r *Runner) sessionDBPath() string {
+	sessionDB := strings.TrimSpace(r.cfg.SessionDB)
+	if sessionDB == "" {
+		sessionDB = "data/whatsapp.db"
+	}
+	return sessionDB
+}
+
+func removeWhatsAppSessionDB(path string) error {
+	for _, target := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func sqliteDSN(path string) string {

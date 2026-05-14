@@ -108,10 +108,14 @@ func (s *MidtransService) CreateSnapTransaction(orderID string, productID string
 		return nil, err
 	}
 
-	url := "https://app.sandbox.midtrans.com/snap/v1/transactions"
-	if s.Config.MidtransIsProduction {
-		url = "https://app.midtrans.com/snap/v1/transactions"
+	baseURL := normalizeMidtransBaseURL(s.Config.MidtransSnapBaseURL, "/snap")
+	if baseURL == "" {
+		baseURL = "https://app.sandbox.midtrans.com"
 	}
+	if s.Config.MidtransIsProduction {
+		baseURL = "https://app.midtrans.com"
+	}
+	url := baseURL + "/snap/v1/transactions"
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
 	if err != nil {
@@ -146,17 +150,31 @@ func (s *MidtransService) CreateSnapTransaction(orderID string, productID string
 	return &snapResp, nil
 }
 
+func (s *MidtransService) SnapJSScriptURL() string {
+	baseURL := normalizeMidtransBaseURL(s.Config.MidtransSnapBaseURL, "/snap")
+	if baseURL == "" {
+		baseURL = "https://app.sandbox.midtrans.com"
+	}
+	if s.Config.MidtransIsProduction {
+		baseURL = "https://app.midtrans.com"
+	}
+	return baseURL + "/snap/snap.js"
+}
+
 func (s *MidtransService) GetTransactionStatus(orderID string) (*TransactionStatusResponse, error) {
 	if strings.TrimSpace(s.Config.MidtransServerKey) == "" {
 		return nil, errors.New("MIDTRANS_SERVER_KEY is not configured")
 	}
 
-	baseURL := "https://api.sandbox.midtrans.com/v2"
+	baseURL := normalizeMidtransBaseURL(s.Config.MidtransBaseURL, "/v2")
+	if baseURL == "" {
+		baseURL = "https://api.sandbox.midtrans.com"
+	}
 	if s.Config.MidtransIsProduction {
-		baseURL = "https://api.midtrans.com/v2"
+		baseURL = "https://api.midtrans.com"
 	}
 
-	req, err := http.NewRequest("GET", baseURL+"/"+orderID+"/status", nil)
+	req, err := http.NewRequest("GET", baseURL+"/v2/"+orderID+"/status", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -191,4 +209,12 @@ func (s *MidtransService) VerifySignatureKey(orderID string, statusCode string, 
 	hash := sha512.Sum512([]byte(data))
 	calculatedSignature := hex.EncodeToString(hash[:])
 	return calculatedSignature == signatureKey
+}
+
+func normalizeMidtransBaseURL(value string, suffix string) string {
+	baseURL := strings.TrimRight(strings.TrimSpace(value), "/")
+	if baseURL == "" {
+		return ""
+	}
+	return strings.TrimRight(strings.TrimSuffix(baseURL, suffix), "/")
 }

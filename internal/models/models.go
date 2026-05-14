@@ -75,6 +75,49 @@ type UsageWindow struct {
 	TokenOutput   int `json:"tokenOutput"`
 }
 
+type AdminUserUsage struct {
+	UserID             string     `json:"userId"`
+	Email              string     `json:"email"`
+	Name               string     `json:"name"`
+	Plan               string     `json:"plan"`
+	SubscriptionStatus string     `json:"subscriptionStatus"`
+	EntitledUntil      *time.Time `json:"entitledUntil"`
+	CreatedAt          time.Time  `json:"createdAt"`
+	PromptCount        int        `json:"promptCount"`
+	ImageCount         int        `json:"imageCount"`
+	ResearchCount      int        `json:"researchCount"`
+	TokenInput         int        `json:"tokenInput"`
+	TokenOutput        int        `json:"tokenOutput"`
+}
+
+type AdminPaymentSummary struct {
+	ID        string    `json:"id"`
+	UserID    string    `json:"userId"`
+	Email     string    `json:"email"`
+	OrderID   string    `json:"orderId"`
+	Platform  string    `json:"platform"`
+	ProductID string    `json:"productId"`
+	Amount    int       `json:"amount"`
+	Currency  string    `json:"currency"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type AdminOverview struct {
+	TotalUsers          int                   `json:"totalUsers"`
+	ActiveSubscriptions int                   `json:"activeSubscriptions"`
+	TrialSubscriptions  int                   `json:"trialSubscriptions"`
+	PaymentTotalAmount  int                   `json:"paymentTotalAmount"`
+	TotalPromptCount    int                   `json:"totalPromptCount"`
+	TotalImageCount     int                   `json:"totalImageCount"`
+	TotalResearchCount  int                   `json:"totalResearchCount"`
+	TotalTokenInput     int                   `json:"totalTokenInput"`
+	TotalTokenOutput    int                   `json:"totalTokenOutput"`
+	UsageByUser         []AdminUserUsage      `json:"usageByUser"`
+	RecentPayments      []AdminPaymentSummary `json:"recentPayments"`
+}
+
 type RuntimeModels struct {
 	Active string   `json:"active"`
 	All    []string `json:"all"`
