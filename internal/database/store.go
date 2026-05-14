@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -16,6 +17,13 @@ import (
 
 type Store struct {
 	db *sql.DB
+}
+
+var ErrEmailAlreadyExists = errors.New("email already exists")
+
+type PasswordAccount struct {
+	User         models.User
+	PasswordHash string
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
@@ -36,6 +44,161 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+func (s *Store) CreatePasswordUser(ctx context.Context, email string, name string, passwordHash string) (models.User, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return models.User{}, err
+	}
+	defer tx.Rollback()
+
+	var existingID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM users WHERE email = $1`, email).Scan(&existingID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return models.User{}, err
+	}
+	if err == nil {
+		return models.User{}, ErrEmailAlreadyExists
+	}
+
+	userID := newID("usr")
+	_, err = tx.ExecContext(
+		ctx,
+		`INSERT INTO users (id, email, name) VALUES ($1, $2, $3)`,
+		userID,
+		email,
+		name,
+	)
+	if err != nil {
+		return models.User{}, err
+	}
+
+	_, err = tx.ExecContext(
+		ctx,
+		`INSERT INTO password_accounts (user_id, email, password_hash) VALUES ($1, $2, $3)`,
+		userID,
+		email,
+		passwordHash,
+	)
+	if err != nil {
+		return models.User{}, err
+	}
+
+	user, err := scanUser(tx.QueryRowContext(ctx, userSelectSQL()+` WHERE id = $1`, userID))
+	if err != nil {
+		return models.User{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return models.User{}, err
+	}
+	return user, nil
+}
+
+func (s *Store) EnsurePasswordUser(ctx context.Context, email string, name string, passwordHash string) (models.User, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	name = strings.TrimSpace(name)
+	if email == "" {
+		return models.User{}, errors.New("email is required")
+	}
+	if name == "" {
+		name = strings.Split(email, "@")[0]
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return models.User{}, err
+	}
+	defer tx.Rollback()
+
+	var userID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM users WHERE email = $1`, email).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		userID = newID("usr")
+		_, err = tx.ExecContext(
+			ctx,
+			`INSERT INTO users (id, email, name) VALUES ($1, $2, $3)`,
+			userID,
+			email,
+			name,
+		)
+	}
+	if err != nil {
+		return models.User{}, err
+	}
+
+	_, err = tx.ExecContext(
+		ctx,
+		`INSERT INTO password_accounts (user_id, email, password_hash)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (user_id) DO UPDATE
+		 SET email = EXCLUDED.email,
+		     password_hash = EXCLUDED.password_hash,
+		     updated_at = NOW()`,
+		userID,
+		email,
+		passwordHash,
+	)
+	if err != nil {
+		return models.User{}, err
+	}
+
+	user, err := scanUser(tx.QueryRowContext(ctx, userSelectSQL()+` WHERE id = $1`, userID))
+	if err != nil {
+		return models.User{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return models.User{}, err
+	}
+	return user, nil
+}
+
+func (s *Store) StartTrialSubscription(ctx context.Context, userID string, duration time.Duration) error {
+	if duration <= 0 {
+		duration = 72 * time.Hour
+	}
+	entitledUntil := time.Now().UTC().Add(duration)
+	return s.UpsertSubscription(
+		ctx,
+		userID,
+		"miaw",
+		"miaw_pro_trial_3d",
+		"trialing",
+		&entitledUntil,
+		json.RawMessage(`{"source":"register","trialDays":3}`),
+	)
+}
+
+func (s *Store) FindPasswordAccountByEmail(ctx context.Context, email string) (PasswordAccount, error) {
+	row := s.db.QueryRowContext(
+		ctx,
+		`SELECT u.id, u.email, u.name, u.avatar_url, u.plan, u.subscription_status, u.entitled_until, u.created_at, pa.password_hash
+		 FROM password_accounts pa
+		 JOIN users u ON u.id = pa.user_id
+		 WHERE pa.email = $1`,
+		email,
+	)
+
+	var account PasswordAccount
+	var entitledUntil sql.NullTime
+	err := row.Scan(
+		&account.User.ID,
+		&account.User.Email,
+		&account.User.Name,
+		&account.User.AvatarURL,
+		&account.User.Plan,
+		&account.User.SubscriptionStatus,
+		&entitledUntil,
+		&account.User.CreatedAt,
+		&account.PasswordHash,
+	)
+	if err != nil {
+		return PasswordAccount{}, err
+	}
+	if entitledUntil.Valid {
+		account.User.EntitledUntil = &entitledUntil.Time
+	}
+	return account, nil
 }
 
 func (s *Store) FindOrCreateOAuthUser(ctx context.Context, profile models.OAuthProfile) (models.User, error) {
@@ -64,6 +227,7 @@ func (s *Store) FindOrCreateOAuthUser(ctx context.Context, profile models.OAuthP
 		return models.User{}, err
 	}
 
+	createdUser := false
 	if errors.Is(err, sql.ErrNoRows) {
 		err = tx.QueryRowContext(ctx, `SELECT id FROM users WHERE email = $1`, profile.Email).Scan(&userID)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -76,6 +240,7 @@ func (s *Store) FindOrCreateOAuthUser(ctx context.Context, profile models.OAuthP
 				profile.Name,
 				profile.AvatarURL,
 			)
+			createdUser = true
 		}
 		if err != nil {
 			return models.User{}, err
@@ -113,6 +278,39 @@ func (s *Store) FindOrCreateOAuthUser(ctx context.Context, profile models.OAuthP
 		return models.User{}, err
 	}
 
+	if createdUser && profile.Provider != "dev" {
+		entitledUntil := time.Now().UTC().Add(72 * time.Hour)
+		_, err = tx.ExecContext(
+			ctx,
+			`INSERT INTO subscriptions (id, user_id, platform, product_id, status, current_period_end, raw_payload)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			newID("sub"),
+			userID,
+			"miaw",
+			"miaw_pro_trial_3d",
+			"trialing",
+			entitledUntil,
+			json.RawMessage(`{"source":"oauth","trialDays":3}`),
+		)
+		if err != nil {
+			return models.User{}, err
+		}
+		_, err = tx.ExecContext(
+			ctx,
+			`UPDATE users
+			 SET plan = 'pro',
+			     subscription_status = 'trialing',
+			     entitled_until = $2,
+			     updated_at = NOW()
+			 WHERE id = $1`,
+			userID,
+			entitledUntil,
+		)
+		if err != nil {
+			return models.User{}, err
+		}
+	}
+
 	user, err := scanUser(tx.QueryRowContext(ctx, userSelectSQL()+` WHERE id = $1`, userID))
 	if err != nil {
 		return models.User{}, err
@@ -124,6 +322,9 @@ func (s *Store) FindOrCreateOAuthUser(ctx context.Context, profile models.OAuthP
 }
 
 func (s *Store) GetUserByID(ctx context.Context, id string) (models.User, error) {
+	if err := s.refreshUserEntitlement(ctx, id); err != nil {
+		return models.User{}, err
+	}
 	return scanUser(s.db.QueryRowContext(ctx, userSelectSQL()+` WHERE id = $1`, id))
 }
 
@@ -185,6 +386,7 @@ func (s *Store) UpsertSubscription(ctx context.Context, userID string, platform 
 	if len(raw) == 0 {
 		raw = json.RawMessage(`{}`)
 	}
+	status = NormalizeSubscriptionStatus(status)
 
 	_, err := s.db.ExecContext(
 		ctx,
@@ -210,30 +412,57 @@ func (s *Store) UpsertSubscription(ctx context.Context, userID string, platform 
 }
 
 func (s *Store) refreshUserEntitlement(ctx context.Context, userID string) error {
-	var entitledUntil sql.NullTime
-	var activeCount int
-	err := s.db.QueryRowContext(
+	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT COUNT(*), MAX(current_period_end)
+		`SELECT status, current_period_end
 		 FROM subscriptions
 		 WHERE user_id = $1
-		   AND status IN ('trialing', 'active')
-		   AND (current_period_end IS NULL OR current_period_end > NOW())`,
+		 ORDER BY updated_at DESC`,
 		userID,
-	).Scan(&activeCount, &entitledUntil)
+	)
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
 
 	plan := "free"
 	status := "none"
 	var until any
-	if activeCount > 0 {
-		plan = "pro"
-		status = "active"
+	var fallbackStatus string
+	now := time.Now().UTC()
+
+	for rows.Next() {
+		var subscriptionStatus string
+		var currentPeriodEnd sql.NullTime
+		if err := rows.Scan(&subscriptionStatus, &currentPeriodEnd); err != nil {
+			return err
+		}
+
+		normalized := NormalizeSubscriptionStatus(subscriptionStatus)
+		if normalized == "trialing" || normalized == "active" {
+			if !currentPeriodEnd.Valid || currentPeriodEnd.Time.After(now) {
+				plan = "pro"
+				status = normalized
+				if currentPeriodEnd.Valid {
+					until = currentPeriodEnd.Time
+				}
+				break
+			}
+			if fallbackStatus == "" {
+				fallbackStatus = "expired"
+			}
+			continue
+		}
+
+		if fallbackStatus == "" || subscriptionStatusRank(normalized) < subscriptionStatusRank(fallbackStatus) {
+			fallbackStatus = normalized
+		}
 	}
-	if entitledUntil.Valid {
-		until = entitledUntil.Time
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if status == "none" && fallbackStatus != "" {
+		status = fallbackStatus
 	}
 
 	_, err = s.db.ExecContext(
@@ -247,6 +476,47 @@ func (s *Store) refreshUserEntitlement(ctx context.Context, userID string) error
 		until,
 	)
 	return err
+}
+
+func NormalizeSubscriptionStatus(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "trial", "trialing":
+		return "trialing"
+	case "active", "settlement", "paid":
+		return "active"
+	case "hold", "on_hold", "payment_hold", "account_hold":
+		return "hold"
+	case "suspend", "suspended":
+		return "suspended"
+	case "past_due", "pastdue", "grace_period":
+		return "past_due"
+	case "cancel", "cancelled", "canceled":
+		return "canceled"
+	case "expire", "expired":
+		return "expired"
+	default:
+		if strings.TrimSpace(status) == "" {
+			return "none"
+		}
+		return strings.ToLower(strings.TrimSpace(status))
+	}
+}
+
+func subscriptionStatusRank(status string) int {
+	switch status {
+	case "hold":
+		return 1
+	case "suspended":
+		return 2
+	case "past_due":
+		return 3
+	case "canceled":
+		return 4
+	case "expired":
+		return 5
+	default:
+		return 9
+	}
 }
 
 type rowScanner interface {
@@ -285,4 +555,8 @@ func newID(prefix string) string {
 		panic(err)
 	}
 	return prefix + "_" + hex.EncodeToString(bytes[:])
+}
+
+func NewID(prefix string) string {
+	return newID(prefix)
 }

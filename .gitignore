@@ -1,3 +1,6 @@
 .env
 bin/
 tmp/
+storage/
+data/
+api.exe

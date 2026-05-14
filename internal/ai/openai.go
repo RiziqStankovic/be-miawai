@@ -21,6 +21,17 @@ type RuntimeSettings struct {
 	SystemPrompt string
 }
 
+type TokenUsage struct {
+	PromptTokens     int `json:"promptTokens"`
+	CompletionTokens int `json:"completionTokens"`
+	TotalTokens      int `json:"totalTokens"`
+}
+
+type ChatResult struct {
+	Content string
+	Usage   TokenUsage
+}
+
 type Client struct {
 	http *http.Client
 }
@@ -102,6 +113,163 @@ func (c *Client) StreamChat(
 	messages []map[string]string,
 	onDelta func(string) error,
 ) (string, error) {
+	chatMessages := make([]map[string]any, 0, len(messages))
+	for _, message := range messages {
+		chatMessages = append(chatMessages, map[string]any{
+			"role":    message["role"],
+			"content": message["content"],
+		})
+	}
+	return c.StreamChatAny(ctx, settings, chatMessages, onDelta)
+}
+
+func (c *Client) StreamChatAny(
+	ctx context.Context,
+	settings RuntimeSettings,
+	messages []map[string]any,
+	onDelta func(string) error,
+) (string, error) {
+	result, err := c.StreamChatAnyWithUsage(ctx, settings, messages, onDelta)
+	return result.Content, err
+}
+
+func (c *Client) StreamChatAnyWithUsage(
+	ctx context.Context,
+	settings RuntimeSettings,
+	messages []map[string]any,
+	onDelta func(string) error,
+) (ChatResult, error) {
+	if strings.TrimSpace(settings.BaseURL) == "" {
+		return ChatResult{}, errors.New("chat base URL is not configured")
+	}
+	if strings.TrimSpace(settings.Model) == "" {
+		return ChatResult{}, errors.New("active model is not configured")
+	}
+
+	chatMessages := make([]map[string]any, 0, len(messages)+1)
+	if prompt := strings.TrimSpace(settings.SystemPrompt); prompt != "" {
+		chatMessages = append(chatMessages, map[string]any{
+			"role":    "system",
+			"content": prompt,
+		})
+	}
+	chatMessages = append(chatMessages, messages...)
+
+	body, err := json.Marshal(map[string]any{
+		"model":          settings.Model,
+		"messages":       chatMessages,
+		"stream":         true,
+		"stream_options": map[string]any{"include_usage": true},
+	})
+	if err != nil {
+		return ChatResult{}, err
+	}
+
+	endpoint, err := resolveEndpoint(settings.BaseURL, "/chat/completions")
+	if err != nil {
+		return ChatResult{}, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return ChatResult{}, err
+	}
+	applyHeaders(req, settings.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return ChatResult{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return ChatResult{}, errors.New(fallbackBodyMessage(payload, fmt.Sprintf("provider returned %d", resp.StatusCode)))
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	var full strings.Builder
+	var usage TokenUsage
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return ChatResult{}, err
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "data: ") {
+			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data: "))
+			if payload == "[DONE]" {
+				return ChatResult{Content: full.String(), Usage: usage}, nil
+			}
+
+			var chunk struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+					Message struct {
+						Content string `json:"content"`
+					} `json:"message"`
+				} `json:"choices"`
+				Error *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+				Usage *struct {
+					PromptTokens     int `json:"prompt_tokens"`
+					CompletionTokens int `json:"completion_tokens"`
+					TotalTokens      int `json:"total_tokens"`
+				} `json:"usage"`
+			}
+			if json.Unmarshal([]byte(payload), &chunk) == nil {
+				if chunk.Error != nil {
+					return ChatResult{}, errors.New(chunk.Error.Message)
+				}
+				if chunk.Usage != nil {
+					usage = TokenUsage{
+						PromptTokens:     chunk.Usage.PromptTokens,
+						CompletionTokens: chunk.Usage.CompletionTokens,
+						TotalTokens:      chunk.Usage.TotalTokens,
+					}
+				}
+
+				if len(chunk.Choices) > 0 {
+					content := chunk.Choices[0].Delta.Content
+					if content == "" {
+						content = chunk.Choices[0].Message.Content
+					}
+					if content != "" {
+						full.WriteString(content)
+						if err := onDelta(content); err != nil {
+							return ChatResult{}, err
+						}
+					}
+				}
+			}
+		}
+
+		if errors.Is(err, io.EOF) {
+			break
+		}
+	}
+
+	return ChatResult{Content: full.String(), Usage: usage}, nil
+}
+
+func (c *Client) Chat(ctx context.Context, settings RuntimeSettings, messages []map[string]string) (string, error) {
+	chatMessages := make([]map[string]any, 0, len(messages))
+	for _, message := range messages {
+		chatMessages = append(chatMessages, map[string]any{
+			"role":    message["role"],
+			"content": message["content"],
+		})
+	}
+	return c.ChatAny(ctx, settings, chatMessages)
+}
+
+func (c *Client) ChatAny(ctx context.Context, settings RuntimeSettings, messages []map[string]any) (string, error) {
 	if strings.TrimSpace(settings.BaseURL) == "" {
 		return "", errors.New("chat base URL is not configured")
 	}
@@ -109,9 +277,9 @@ func (c *Client) StreamChat(
 		return "", errors.New("active model is not configured")
 	}
 
-	chatMessages := make([]map[string]string, 0, len(messages)+1)
+	chatMessages := make([]map[string]any, 0, len(messages)+1)
 	if prompt := strings.TrimSpace(settings.SystemPrompt); prompt != "" {
-		chatMessages = append(chatMessages, map[string]string{
+		chatMessages = append(chatMessages, map[string]any{
 			"role":    "system",
 			"content": prompt,
 		})
@@ -121,7 +289,7 @@ func (c *Client) StreamChat(
 	body, err := json.Marshal(map[string]any{
 		"model":    settings.Model,
 		"messages": chatMessages,
-		"stream":   true,
+		"stream":   false,
 	})
 	if err != nil {
 		return "", err
@@ -150,61 +318,26 @@ func (c *Client) StreamChat(
 		return "", errors.New(fallbackBodyMessage(payload, fmt.Sprintf("provider returned %d", resp.StatusCode)))
 	}
 
-	reader := bufio.NewReader(resp.Body)
-	var full strings.Builder
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil && !errors.Is(err, io.EOF) {
-			return "", err
-		}
-
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "data: ") {
-			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data: "))
-			if payload == "[DONE]" {
-				return full.String(), nil
-			}
-
-			var chunk struct {
-				Choices []struct {
-					Delta struct {
-						Content string `json:"content"`
-					} `json:"delta"`
-					Message struct {
-						Content string `json:"content"`
-					} `json:"message"`
-				} `json:"choices"`
-				Error *struct {
-					Message string `json:"message"`
-				} `json:"error"`
-			}
-			if json.Unmarshal([]byte(payload), &chunk) == nil {
-				if chunk.Error != nil {
-					return "", errors.New(chunk.Error.Message)
-				}
-
-				if len(chunk.Choices) > 0 {
-					content := chunk.Choices[0].Delta.Content
-					if content == "" {
-						content = chunk.Choices[0].Message.Content
-					}
-					if content != "" {
-						full.WriteString(content)
-						if err := onDelta(content); err != nil {
-							return "", err
-						}
-					}
-				}
-			}
-		}
-
-		if errors.Is(err, io.EOF) {
-			break
-		}
+	var payload struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-
-	return full.String(), nil
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if payload.Error != nil {
+		return "", errors.New(payload.Error.Message)
+	}
+	if len(payload.Choices) == 0 {
+		return "", errors.New("provider returned no choices")
+	}
+	return payload.Choices[0].Message.Content, nil
 }
 
 func resolveEndpoint(baseURL string, suffix string) (string, error) {

@@ -1,0 +1,47 @@
+use_default_settings: true
+
+server:
+  secret_key: "miawai-searxng-local-dev-secret-key-change-if-exposed"
+  limiter: false
+  public_instance: false
+  image_proxy: true
+  method: "GET"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+outgoing:
+  request_timeout: 5.0
+  max_request_timeout: 10.0
+  retries: 1
+
+engines:
+  - name: bing
+    engine: bing
+    disabled: true
+    weight: 2
+
+  - name: duckduckgo
+    engine: duckduckgo
+    disabled: false
+    weight: 2
+
+  - name: wikipedia
+    engine: wikipedia
+    disabled: false
+    weight: 2
+
+  - name: github
+    engine: github
+    disabled: false
+    weight: 2
+
+  - name: stackoverflow
+    engine: stackoverflow
+    disabled: false
+    weight: 2

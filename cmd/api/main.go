@@ -14,6 +14,10 @@ import (
 	"be-miawai/internal/database"
 	"be-miawai/internal/handlers"
 	"be-miawai/internal/middleware"
+	"be-miawai/internal/models"
+	"be-miawai/internal/whatsapp"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func main() {
@@ -29,9 +33,26 @@ func main() {
 	if err := store.RunMigrations(ctx, "migrations"); err != nil {
 		log.Fatalf("run migrations: %v", err)
 	}
+	if cfg.AdminBootstrapEnabled {
+		admin, err := bootstrapAdmin(ctx, store, cfg)
+		if err != nil {
+			log.Fatalf("bootstrap admin: %v", err)
+		}
+		if cfg.WhatsAppOwnerUserID == "" {
+			cfg.WhatsAppOwnerUserID = admin.ID
+		}
+	}
 
 	api := handlers.NewServer(cfg, store)
 	handler := middleware.CORS(cfg.CORSOrigins)(api.Routes())
+	waRunner := whatsapp.NewRunner(whatsapp.Config{
+		Enabled:      cfg.WhatsAppEnabled,
+		ListenGroups: cfg.WhatsAppListenGroups,
+		SessionDB:    cfg.WhatsAppSessionDB,
+	}, api)
+	if err := waRunner.Start(ctx); err != nil {
+		log.Fatalf("start whatsapp: %v", err)
+	}
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -52,7 +73,21 @@ func main() {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	waRunner.Stop(shutdownCtx)
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
+}
+
+func bootstrapAdmin(ctx context.Context, store *database.Store, cfg config.Config) (models.User, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(cfg.AdminBootstrapPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return models.User{}, err
+	}
+	user, err := store.EnsurePasswordUser(ctx, cfg.AdminBootstrapEmail, cfg.AdminBootstrapName, string(hash))
+	if err != nil {
+		return models.User{}, err
+	}
+	log.Printf("admin bootstrap ready email=%s user=%s", user.Email, user.ID)
+	return user, nil
 }
