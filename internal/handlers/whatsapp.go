@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"be-miawai/internal/database"
 	"be-miawai/internal/models"
@@ -49,6 +50,16 @@ func (s *Server) listWhatsAppAccounts(w http.ResponseWriter, r *http.Request, us
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load whatsapp accounts")
 		return
+	}
+	if !hasAccess(user, accessAdmin) && strings.TrimSpace(s.cfg.WhatsAppOwnerUserID) != "" {
+		central, err := s.store.GetOrCreateCentralWhatsAppAccount(r.Context(), s.cfg.WhatsAppOwnerUserID)
+		if err != nil {
+			log.Printf("load central whatsapp account failed: %v", err)
+		} else if strings.EqualFold(central.Status, "connected") && strings.TrimSpace(central.PhoneJID) != "" {
+			central.QRCode = ""
+			central.SessionRef = ""
+			accounts = append(accounts, central)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string][]models.WhatsAppAccount{"accounts": accounts})
 }
@@ -378,10 +389,16 @@ func (s *Server) whatsAppInbound(w http.ResponseWriter, r *http.Request) {
 
 var errWhatsAppBadRequest = errors.New("invalid whatsapp inbound request")
 
+const maxWhatsAppInboundAge = 5 * time.Minute
+
 func (s *Server) HandleWhatsAppInbound(ctx context.Context, input WhatsAppInboundInput) (WhatsAppInboundResult, error) {
 	text := strings.TrimSpace(input.Text)
 	if strings.TrimSpace(input.AccountID) == "" || strings.TrimSpace(input.ContactJID) == "" || (text == "" && len(input.Images) == 0) {
 		return WhatsAppInboundResult{}, errWhatsAppBadRequest
+	}
+	if !isRecentWhatsAppInbound(input.Timestamp, time.Now()) {
+		log.Printf("whatsapp inbound ignored account=%s contact=%s message=%s reason=stale timestamp=%q", input.AccountID, input.ContactJID, input.MessageID, input.Timestamp)
+		return WhatsAppInboundResult{}, nil
 	}
 	_, _ = s.store.CreateWhatsAppEvent(ctx, models.WhatsAppEvent{
 		WhatsAppAccountID: input.AccountID,
@@ -398,6 +415,10 @@ func (s *Server) HandleWhatsAppInbound(ctx context.Context, input WhatsAppInboun
 			return WhatsAppInboundResult{}, err
 		}
 		return WhatsAppInboundResult{}, errors.New("failed to resolve whatsapp contact")
+	}
+	if !strings.EqualFold(account.Status, "connected") {
+		log.Printf("whatsapp inbound ignored account=%s contact=%s message=%s reason=account_not_connected status=%s", account.ID, contact.ContactJID, input.MessageID, account.Status)
+		return WhatsAppInboundResult{}, nil
 	}
 	if account.Mode == "central_bot" && contact.AllowStatus != "allowed" {
 		if contact.AllowStatus == "blocked" && !isWhatsAppLinkCodeText(text) {
@@ -511,6 +532,15 @@ func isWhatsAppLinkCodeText(text string) bool {
 		}
 	}
 	return true
+}
+
+func isRecentWhatsAppInbound(rawTimestamp string, now time.Time) bool {
+	timestamp, err := time.Parse(time.RFC3339, strings.TrimSpace(rawTimestamp))
+	if err != nil || timestamp.IsZero() {
+		return false
+	}
+	age := now.Sub(timestamp)
+	return age >= -time.Minute && age <= maxWhatsAppInboundAge
 }
 
 func (s *Server) processWhatsAppMessage(ctx context.Context, user models.User, account models.WhatsAppAccount, contact models.WhatsAppContact, text string, images []models.ChatImageInput) (string, models.Conversation, error) {

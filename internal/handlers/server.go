@@ -188,11 +188,31 @@ func (s *Server) adminOverview(w http.ResponseWriter, r *http.Request, user mode
 	type usageRow struct {
 		models.AdminUserUsage
 		EstimatedCostUSD float64 `json:"estimatedCostUsd"`
+		TotalCreditUSD   float64 `json:"totalCreditUsd"`
 	}
 	usage := make([]usageRow, 0, len(overview.UsageByUser))
 	for _, item := range overview.UsageByUser {
 		cost := tokenCostUSD(item.TokenInput+item.TokenOutput, s.cfg.AICostUSDPer1KTokens)
-		usage = append(usage, usageRow{AdminUserUsage: item, EstimatedCostUSD: cost})
+		purchasedCreditUSD, err := s.store.GetSettledCreditPurchaseUSD(r.Context(), item.UserID)
+		if err != nil {
+			log.Printf("admin overview credit failed user_id=%s err=%v", item.UserID, err)
+			writeError(w, http.StatusInternalServerError, "failed to load admin overview")
+			return
+		}
+		includedCreditUSD := includedCreditUSDForUser(s.cfg, models.User{
+			ID:                 item.UserID,
+			Email:              item.Email,
+			Name:               item.Name,
+			Plan:               item.Plan,
+			SubscriptionStatus: item.SubscriptionStatus,
+			EntitledUntil:      item.EntitledUntil,
+			CreatedAt:          item.CreatedAt,
+		})
+		usage = append(usage, usageRow{
+			AdminUserUsage:   item,
+			EstimatedCostUSD: cost,
+			TotalCreditUSD:   roundCurrency(maxFloat(0, includedCreditUSD+purchasedCreditUSD)),
+		})
 	}
 	totalCost := tokenCostUSD(overview.TotalTokenInput+overview.TotalTokenOutput, s.cfg.AICostUSDPer1KTokens)
 
@@ -429,7 +449,7 @@ func (s *Server) oauthCallback(provider string) http.HandlerFunc {
 			return
 		}
 
-		http.Redirect(w, r, s.cfg.AppBaseURL, http.StatusFound)
+		http.Redirect(w, r, workspaceRedirectURL(s.cfg.AppBaseURL), http.StatusFound)
 	}
 }
 
@@ -2970,6 +2990,21 @@ func systemPromptWithContexts(systemPrompt string, contexts ...string) string {
 		}
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+func workspaceRedirectURL(appBaseURL string) string {
+	base := strings.TrimRight(strings.TrimSpace(appBaseURL), "/")
+	if base == "" {
+		return "/workspace"
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return base + "/workspace"
+	}
+	if strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), "/workspace") {
+		return base
+	}
+	return base + "/workspace"
 }
 
 func firstHTTPURL(text string) string {

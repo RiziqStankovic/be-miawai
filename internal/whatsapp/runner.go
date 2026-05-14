@@ -39,6 +39,8 @@ type Config struct {
 	SessionDB    string
 }
 
+const maxInboundMessageAge = 5 * time.Minute
+
 type Runner struct {
 	cfg     Config
 	backend Backend
@@ -249,6 +251,25 @@ func (r *Runner) handleEvent(evt any) {
 		log.Printf("whatsapp message ignored account=%s id=%s reason=from_me chat=%s", r.account.ID, msg.Info.ID, msg.Info.Chat)
 		return
 	}
+	if isBroadcastOrStatusMessage(msg) {
+		log.Printf("whatsapp message ignored account=%s id=%s reason=broadcast_or_status chat=%s sender=%s", r.account.ID, msg.Info.ID, msg.Info.Chat, msg.Info.Sender)
+		return
+	}
+	if !r.readyForInbound() {
+		log.Printf("whatsapp message ignored account=%s id=%s reason=not_connected chat=%s", r.account.ID, msg.Info.ID, msg.Info.Chat)
+		return
+	}
+	if !recentInboundTimestamp(msg.Info.Timestamp, time.Now()) {
+		log.Printf(
+			"whatsapp message ignored account=%s id=%s reason=stale timestamp=%s max_age=%s chat=%s",
+			r.account.ID,
+			msg.Info.ID,
+			msg.Info.Timestamp.UTC().Format(time.RFC3339),
+			maxInboundMessageAge,
+			msg.Info.Chat,
+		)
+		return
+	}
 	if msg.Info.Chat.Server == types.GroupServer && !r.cfg.ListenGroups {
 		log.Printf("whatsapp message ignored account=%s id=%s reason=group_disabled chat=%s", r.account.ID, msg.Info.ID, msg.Info.Chat)
 		return
@@ -260,6 +281,36 @@ func (r *Runner) handleEvent(evt any) {
 		return
 	}
 	go r.reply(context.Background(), msg, text)
+}
+
+func (r *Runner) readyForInbound() bool {
+	if r.client == nil {
+		return false
+	}
+	return r.client.IsConnected() && r.client.IsLoggedIn() && strings.EqualFold(r.account.Status, "connected")
+}
+
+func recentInboundTimestamp(timestamp time.Time, now time.Time) bool {
+	if timestamp.IsZero() {
+		return false
+	}
+	age := now.Sub(timestamp)
+	return age >= -time.Minute && age <= maxInboundMessageAge
+}
+
+func isBroadcastOrStatusMessage(msg *events.Message) bool {
+	if msg == nil {
+		return true
+	}
+	chat := strings.ToLower(msg.Info.Chat.String())
+	sender := strings.ToLower(msg.Info.Sender.String())
+	if chat == "status@broadcast" || sender == "status@broadcast" {
+		return true
+	}
+	if strings.HasSuffix(chat, "@broadcast") || strings.HasSuffix(sender, "@broadcast") {
+		return true
+	}
+	return false
 }
 
 func (r *Runner) handleHealthEvent(evt any) {
