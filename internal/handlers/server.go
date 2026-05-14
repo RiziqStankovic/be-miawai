@@ -645,10 +645,15 @@ func (s *Server) usageStatus(w http.ResponseWriter, r *http.Request, user models
 		writeError(w, http.StatusInternalServerError, "failed to load usage status")
 		return
 	}
+	purchasedCreditUSD, err := s.store.GetSettledCreditPurchaseUSD(r.Context(), user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load usage status")
+		return
+	}
 	fiveHourLimit := periodicTokenLimitForUser(s.cfg, user, "5h")
 	weeklyLimit := periodicTokenLimitForUser(s.cfg, user, "week")
 	weeklyTokenUsage := weeklyUsage.TokenInput + weeklyUsage.TokenOutput
-	credits := buildUsageCreditStatus(includedCreditUSDForUser(s.cfg, user), weeklyTokenUsage, s.cfg.AICostUSDPer1KTokens)
+	credits := buildUsageCreditStatus(includedCreditUSDForUser(s.cfg, user)+purchasedCreditUSD, weeklyTokenUsage, s.cfg.AICostUSDPer1KTokens)
 	plan := strings.ToLower(firstNonEmpty(user.Plan, "free"))
 	if plan == "pro" && user.SubscriptionStatus == "trialing" {
 		plan = "pro_trial"
@@ -2845,7 +2850,12 @@ func buildUsageCreditStatus(initialCreditUSD float64, usedTokens int, costUSDPer
 
 func (s *Server) hasRemainingWeeklyUsageCredit(ctx context.Context, user models.User) (bool, error) {
 	includedCreditUSD := includedCreditUSDForUser(s.cfg, user)
-	if includedCreditUSD <= 0 || s.cfg.AICostUSDPer1KTokens <= 0 {
+	purchasedCreditUSD, err := s.store.GetSettledCreditPurchaseUSD(ctx, user.ID)
+	if err != nil {
+		return false, err
+	}
+	totalCreditUSD := includedCreditUSD + purchasedCreditUSD
+	if totalCreditUSD <= 0 || s.cfg.AICostUSDPer1KTokens <= 0 {
 		return true, nil
 	}
 	now := time.Now().In(wibLocation())
@@ -2855,7 +2865,7 @@ func (s *Server) hasRemainingWeeklyUsageCredit(ctx context.Context, user models.
 		return false, err
 	}
 	weeklyTokenUsage := weeklyUsage.TokenInput + weeklyUsage.TokenOutput
-	credits := buildUsageCreditStatus(includedCreditUSD, weeklyTokenUsage, s.cfg.AICostUSDPer1KTokens)
+	credits := buildUsageCreditStatus(totalCreditUSD, weeklyTokenUsage, s.cfg.AICostUSDPer1KTokens)
 	return credits.Remaining > 0, nil
 }
 

@@ -78,6 +78,29 @@ func (s *Store) GetPaymentByOrderID(ctx context.Context, orderID string) (models
 	return txn, nil
 }
 
+func (s *Store) GetSettledCreditPurchaseUSD(ctx context.Context, userID string) (float64, error) {
+	var total float64
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(SUM(
+		    CASE product_id
+		      WHEN 'miaw_credit_usd_5_idr_25000' THEN 5
+		      WHEN 'miaw_credit_usd_10_idr_50000' THEN 10
+		      WHEN 'miaw_credit_usd_20_idr_100000' THEN 20
+		      ELSE 0
+		    END
+		  ), 0)
+		 FROM payment_transactions
+		 WHERE user_id = $1
+		   AND status IN ('settlement', 'capture', 'paid', 'success')`,
+		userID,
+	).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
 func (s *Store) IncrementDailyUsage(ctx context.Context, userID string, tokenInput int, tokenOutput int, imageCount int, researchCount int) error {
 	usageDate := dailyUsageDate()
 	_, err := s.db.ExecContext(
