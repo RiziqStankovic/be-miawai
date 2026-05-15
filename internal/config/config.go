@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -78,7 +79,7 @@ type Config struct {
 }
 
 func Load() Config {
-	loadDotEnv(".env")
+	loadDotEnvFiles()
 
 	return Config{
 		Port:                      getenv("PORT", "8080"),
@@ -145,6 +146,44 @@ func Load() Config {
 		AdminBootstrapName:     getenv("ADMIN_BOOTSTRAP_NAME", "Miaw Admin"),
 		AdminBootstrapPassword: getenv("ADMIN_BOOTSTRAP_PASSWORD", "admin123"),
 	}
+}
+
+func loadDotEnvFiles() {
+	seen := map[string]bool{}
+	for _, path := range dotenvCandidates() {
+		cleaned, err := filepath.Abs(path)
+		if err != nil {
+			cleaned = filepath.Clean(path)
+		}
+		if seen[cleaned] {
+			continue
+		}
+		seen[cleaned] = true
+		loadDotEnv(cleaned)
+	}
+}
+
+func dotenvCandidates() []string {
+	candidates := []string{".env"}
+
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), ".env"))
+	}
+
+	if wd, err := os.Getwd(); err == nil {
+		for dir := wd; ; dir = filepath.Dir(dir) {
+			candidates = append(candidates,
+				filepath.Join(dir, ".env"),
+				filepath.Join(dir, "be-miawai", ".env"),
+			)
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+		}
+	}
+
+	return candidates
 }
 
 func loadDotEnv(path string) {

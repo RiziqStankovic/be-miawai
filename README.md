@@ -34,10 +34,15 @@ Set `WEB_RESEARCH_ENABLED=true` and run the `searxng` compose service to enable 
 
 `POST /v1/chat/stream` also accepts `"web": true`. If the message contains an `http` or `https` URL, the backend reads that URL; otherwise it searches SearXNG and injects the fetched context into the model prompt.
 
-For OAuth callbacks, configure:
+For OAuth callbacks, set `API_BASE_URL` to the public backend origin used by
+Google/GitHub, then configure matching provider callbacks:
 
-- Google callback: `http://localhost:8080/v1/auth/google/callback`
-- GitHub callback: `http://localhost:8080/v1/auth/github/callback`
+- Google callback: `${API_BASE_URL}/v1/auth/google/callback`
+- GitHub callback: `${API_BASE_URL}/v1/auth/github/callback`
+
+For production, `APP_BASE_URL`, `API_BASE_URL`, `CORS_ORIGINS`, and provider
+callback URLs must use the same deployed frontend/backend origins. If the API is
+served over HTTPS, also set `COOKIE_SECURE=true`.
 
 ## Webhook signature
 
