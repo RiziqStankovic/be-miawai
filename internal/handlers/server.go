@@ -92,8 +92,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/auth/dev-login", s.devLogin)
 	mux.HandleFunc("GET /v1/auth/google/login", s.oauthLogin("google"))
 	mux.HandleFunc("GET /v1/auth/github/login", s.oauthLogin("github"))
+	mux.HandleFunc("GET /v1/auth/desktop/login", s.desktopOAuthLogin)
 	mux.HandleFunc("GET /v1/auth/google/callback", s.oauthCallback("google"))
 	mux.HandleFunc("GET /v1/auth/github/callback", s.oauthCallback("github"))
+	mux.HandleFunc("POST /v1/auth/desktop/exchange", s.desktopTokenExchange)
 	mux.HandleFunc("POST /v1/auth/token-exchange", s.tokenExchange)
 	mux.HandleFunc("POST /v1/auth/logout", s.logout)
 	mux.HandleFunc("GET /v1/me", s.requireUser(s.me))
@@ -408,7 +410,7 @@ func (s *Server) startTrial(w http.ResponseWriter, r *http.Request, user models.
 
 func (s *Server) oauthLogin(provider string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		state, err := auth.SignOAuthState(s.cfg.SessionSecret, provider)
+		state, err := auth.SignOAuthStateForDesktop(s.cfg.SessionSecret, provider, false)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create oauth state")
 			return
@@ -424,9 +426,35 @@ func (s *Server) oauthLogin(provider string) http.HandlerFunc {
 	}
 }
 
+func (s *Server) desktopOAuthLogin(w http.ResponseWriter, r *http.Request) {
+	provider := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("provider")))
+	if provider == "" {
+		provider = "google"
+	}
+	if provider != "google" && provider != "github" {
+		writeError(w, http.StatusBadRequest, "unsupported desktop auth provider")
+		return
+	}
+
+	state, err := auth.SignOAuthStateForDesktop(s.cfg.SessionSecret, provider, true)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create oauth state")
+		return
+	}
+
+	authURL, err := s.buildAuthURL(provider, state)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
 func (s *Server) oauthCallback(provider string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if err := auth.VerifyOAuthState(s.cfg.SessionSecret, r.URL.Query().Get("state"), provider); err != nil {
+		state, err := auth.VerifyOAuthStatePayload(s.cfg.SessionSecret, r.URL.Query().Get("state"), provider)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid oauth state")
 			return
 		}
@@ -451,6 +479,24 @@ func (s *Server) oauthCallback(provider string) http.HandlerFunc {
 
 		user = decorateUserAccess(user)
 
+		if state.Desktop {
+			code, err := s.store.CreateDesktopAuthCode(r.Context(), user.ID, 2*time.Minute)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to create desktop auth code")
+				return
+			}
+			redirectURL := url.URL{
+				Scheme: "miaw",
+				Host:   "auth",
+				Path:   "/callback",
+			}
+			values := redirectURL.Query()
+			values.Set("code", code)
+			redirectURL.RawQuery = values.Encode()
+			http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+			return
+		}
+
 		if err := s.sessions.SetSession(w, auth.SessionIdentity{
 			UserID: user.ID,
 			Email:  user.Email,
@@ -463,6 +509,44 @@ func (s *Server) oauthCallback(provider string) http.HandlerFunc {
 
 		http.Redirect(w, r, workspaceRedirectURL(s.cfg.AppBaseURL), http.StatusFound)
 	}
+}
+
+func (s *Server) desktopTokenExchange(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+
+	user, err := s.store.ConsumeDesktopAuthCode(r.Context(), body.Code)
+	if errors.Is(err, database.ErrDesktopAuthCodeInvalid) {
+		writeError(w, http.StatusUnauthorized, "desktop login expired or already used")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to exchange desktop login")
+		return
+	}
+
+	user = decorateUserAccess(user)
+	identity := auth.SessionIdentity{
+		UserID: user.ID,
+		Email:  user.Email,
+		Role:   user.Role,
+		Access: user.Access,
+	}
+	token, err := s.sessions.SignSession(identity, 30*24*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to sign session")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token": token,
+		"user":  user,
+	})
 }
 
 func (s *Server) tokenExchange(w http.ResponseWriter, r *http.Request) {

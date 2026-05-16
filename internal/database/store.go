@@ -26,6 +26,8 @@ type PasswordAccount struct {
 	PasswordHash string
 }
 
+var ErrDesktopAuthCodeInvalid = errors.New("desktop auth code is invalid or expired")
+
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
@@ -303,6 +305,62 @@ func (s *Store) GetUserByID(ctx context.Context, id string) (models.User, error)
 		return models.User{}, err
 	}
 	return scanUser(s.db.QueryRowContext(ctx, userSelectSQL()+` WHERE id = $1`, id))
+}
+
+func (s *Store) CreateDesktopAuthCode(ctx context.Context, userID string, ttl time.Duration) (string, error) {
+	if ttl <= 0 {
+		ttl = 2 * time.Minute
+	}
+	code := newID("dac")
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO desktop_auth_codes (code, user_id, expires_at)
+		 VALUES ($1, $2, $3)`,
+		code,
+		userID,
+		time.Now().UTC().Add(ttl),
+	)
+	return code, err
+}
+
+func (s *Store) ConsumeDesktopAuthCode(ctx context.Context, code string) (models.User, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return models.User{}, ErrDesktopAuthCodeInvalid
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return models.User{}, err
+	}
+	defer tx.Rollback()
+
+	var userID string
+	err = tx.QueryRowContext(
+		ctx,
+		`UPDATE desktop_auth_codes
+		 SET used_at = NOW()
+		 WHERE code = $1
+		   AND used_at IS NULL
+		   AND expires_at > NOW()
+		 RETURNING user_id`,
+		code,
+	).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return models.User{}, ErrDesktopAuthCodeInvalid
+	}
+	if err != nil {
+		return models.User{}, err
+	}
+
+	user, err := scanUser(tx.QueryRowContext(ctx, userSelectSQL()+` WHERE id = $1`, userID))
+	if err != nil {
+		return models.User{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return models.User{}, err
+	}
+	return user, nil
 }
 
 func (s *Store) InsertChatMessage(ctx context.Context, userID string, role string, content string) (models.ChatMessage, error) {

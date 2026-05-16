@@ -12,12 +12,18 @@ import (
 
 type oauthState struct {
 	Provider string `json:"provider"`
+	Desktop  bool   `json:"desktop,omitempty"`
 	Exp      int64  `json:"exp"`
 }
 
 func SignOAuthState(secret string, provider string) (string, error) {
+	return SignOAuthStateForDesktop(secret, provider, false)
+}
+
+func SignOAuthStateForDesktop(secret string, provider string, desktop bool) (string, error) {
 	payload, err := json.Marshal(oauthState{
 		Provider: provider,
+		Desktop:  desktop,
 		Exp:      time.Now().Add(10 * time.Minute).Unix(),
 	})
 	if err != nil {
@@ -30,29 +36,34 @@ func SignOAuthState(secret string, provider string) (string, error) {
 }
 
 func VerifyOAuthState(secret string, token string, expectedProvider string) error {
+	_, err := VerifyOAuthStatePayload(secret, token, expectedProvider)
+	return err
+}
+
+func VerifyOAuthStatePayload(secret string, token string, expectedProvider string) (oauthState, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 2 {
-		return errors.New("invalid oauth state")
+		return oauthState{}, errors.New("invalid oauth state")
 	}
 
 	expected := sign([]byte(secret), parts[0])
 	if !hmac.Equal([]byte(expected), []byte(parts[1])) {
-		return errors.New("invalid oauth state signature")
+		return oauthState{}, errors.New("invalid oauth state signature")
 	}
 
 	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return err
+		return oauthState{}, err
 	}
 
 	var state oauthState
 	if err := json.Unmarshal(payload, &state); err != nil {
-		return err
+		return oauthState{}, err
 	}
 	if state.Provider != expectedProvider || time.Now().Unix() > state.Exp {
-		return errors.New("oauth state expired")
+		return oauthState{}, errors.New("oauth state expired")
 	}
-	return nil
+	return state, nil
 }
 
 func sign(secret []byte, payload string) string {
