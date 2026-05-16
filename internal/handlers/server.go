@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math"
@@ -493,7 +494,7 @@ func (s *Server) oauthCallback(provider string) http.HandlerFunc {
 			values := redirectURL.Query()
 			values.Set("code", code)
 			redirectURL.RawQuery = values.Encode()
-			http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+			writeDesktopAuthSuccess(w, redirectURL.String(), provider)
 			return
 		}
 
@@ -547,6 +548,170 @@ func (s *Server) desktopTokenExchange(w http.ResponseWriter, r *http.Request) {
 		"token": token,
 		"user":  user,
 	})
+}
+
+func writeDesktopAuthSuccess(w http.ResponseWriter, deepLink string, provider string) {
+	providerLabel := strings.Title(strings.ToLower(strings.TrimSpace(provider)))
+	if providerLabel == "" {
+		providerLabel = "Browser"
+	}
+	escapedDeepLink := html.EscapeString(deepLink)
+	escapedProvider := html.EscapeString(providerLabel)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	page := `<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Miaw Login Berhasil</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --primary: #ff8d5c;
+      --primary-strong: #ff9a6a;
+      --surface: #16120f;
+      --surface-panel: rgba(28, 22, 18, 0.96);
+      --surface-soft: rgba(255, 141, 92, 0.08);
+      --border: rgba(255, 141, 92, 0.18);
+      --text: #f0f0f2;
+      --muted: #9a918d;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(ellipse 70% 42% at 50% 0%, rgba(255, 141, 92, 0.16), transparent 62%),
+        linear-gradient(180deg, #120f0d 0%, #070606 100%);
+    }
+
+    .panel {
+      width: min(440px, 100%);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background: var(--surface-panel);
+      box-shadow:
+        0 24px 80px rgba(0, 0, 0, 0.46),
+        0 0 0 1px rgba(255, 141, 92, 0.06);
+      overflow: hidden;
+    }
+
+    .topline {
+      height: 2px;
+      margin: 0 64px;
+      background: linear-gradient(90deg, transparent, rgba(255, 141, 92, 0.92), transparent);
+    }
+
+    .content {
+      padding: 34px 32px 30px;
+      text-align: center;
+    }
+
+    .mark {
+      width: 56px;
+      height: 56px;
+      margin: 0 auto 18px;
+      display: grid;
+      place-items: center;
+      border-radius: 18px;
+      background: linear-gradient(135deg, var(--primary), #df6a31);
+      color: #1a1a1c;
+      font-weight: 800;
+      font-size: 24px;
+      box-shadow: 0 12px 32px rgba(255, 141, 92, 0.24);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 25px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .status {
+      margin: 22px 0;
+      padding: 12px 14px;
+      border: 1px solid rgba(255, 141, 92, 0.14);
+      border-radius: 14px;
+      background: var(--surface-soft);
+      color: #d8cfca;
+      font-size: 13px;
+    }
+
+    .actions {
+      display: grid;
+      gap: 10px;
+    }
+
+    a.button {
+      display: inline-flex;
+      min-height: 44px;
+      align-items: center;
+      justify-content: center;
+      border-radius: 14px;
+      background: var(--primary);
+      color: #1a1a1c;
+      font-weight: 750;
+      font-size: 14px;
+      text-decoration: none;
+      transition: background 150ms ease, transform 150ms ease;
+    }
+
+    a.button:hover {
+      background: var(--primary-strong);
+      transform: translateY(-1px);
+    }
+
+    .hint {
+      margin-top: 14px;
+      color: #6f6763;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main class="panel">
+    <div class="topline"></div>
+    <section class="content">
+      <div class="mark">M</div>
+      <h1>Login berhasil</h1>
+      <p>Akun {{PROVIDER}} sudah terhubung. Miaw Windows sedang dibuka di perangkat ini.</p>
+      <div class="status">Kalau browser meminta izin, pilih <strong>Open Miaw</strong> untuk menyelesaikan login.</div>
+      <div class="actions">
+        <a class="button" href="{{DEEPLINK}}">Buka Miaw Windows</a>
+      </div>
+      <p class="hint">Tab ini aman untuk ditutup setelah Miaw Windows tampil.</p>
+    </section>
+  </main>
+  <script>
+    const deepLink = "{{DEEPLINK}}";
+    window.setTimeout(() => {
+      window.location.href = deepLink;
+    }, 350);
+  </script>
+</body>
+</html>`
+	page = strings.NewReplacer(
+		"{{PROVIDER}}", escapedProvider,
+		"{{DEEPLINK}}", escapedDeepLink,
+	).Replace(page)
+	_, _ = io.WriteString(w, page)
 }
 
 func (s *Server) tokenExchange(w http.ResponseWriter, r *http.Request) {
