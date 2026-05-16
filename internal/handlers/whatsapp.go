@@ -449,10 +449,7 @@ func (s *Server) HandleWhatsAppInbound(ctx context.Context, input WhatsAppInboun
 		log.Printf("whatsapp inbound ignored account=%s contact=%s message=%s reason=account_not_connected status=%s", account.ID, contact.ContactJID, input.MessageID, account.Status)
 		return WhatsAppInboundResult{}, nil
 	}
-	if account.Mode == "central_bot" && contact.AllowStatus != "allowed" {
-		if contact.AllowStatus == "blocked" && !isWhatsAppLinkCodeText(text) {
-			return WhatsAppInboundResult{}, nil
-		}
+	if account.Mode == "central_bot" && (contact.AllowStatus != "allowed" || contact.LinkedUserID == "") {
 		_, matched, attempts, err := s.store.VerifyWhatsAppLinkCode(ctx, account.ID, contact.ID, contact.ContactJID, text)
 		if err != nil {
 			return WhatsAppInboundResult{}, errors.New("failed to verify whatsapp link code")
@@ -465,7 +462,10 @@ func (s *Server) HandleWhatsAppInbound(ctx context.Context, input WhatsAppInboun
 			s.logWhatsAppOutgoing(ctx, input, result)
 			return result, nil
 		}
-		reply := "Nomor WhatsApp ini belum terhubung ke akun Miaw. Buka Miaw web, Settings > WhatsApp, generate kode, lalu kirim kode itu ke sini."
+		reply := "Nomor WhatsApp ini belum terhubung ke akun Miaw. Buka Miaw web atau Android, Settings > WhatsApp, generate kode, lalu kirim kode itu ke sini."
+		if contact.AllowStatus == "blocked" {
+			reply = "Nomor WhatsApp ini sudah dicabut dari akun Miaw. Generate kode baru dari Miaw web atau Android jika ingin menghubungkan lagi."
+		}
 		if attempts > 0 && attempts < 3 {
 			reply = "Kode verifikasi WhatsApp belum cocok. Sisa percobaan: " + fmtInt(3-attempts) + "."
 		} else if attempts >= 3 {

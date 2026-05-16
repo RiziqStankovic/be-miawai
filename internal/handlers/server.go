@@ -2811,7 +2811,37 @@ func (s *Server) formatStatusReply(ctx context.Context, user models.User, settin
 	builder.WriteString(" · ")
 	builder.WriteString(formatDuration(resetAt.Sub(now)))
 	builder.WriteString(" left")
+	if contacts, err := s.store.ListLinkedWhatsAppContactsByUser(ctx, user.ID); err == nil {
+		builder.WriteByte('\n')
+		builder.WriteString("WhatsApp: ")
+		if len(contacts) == 0 {
+			builder.WriteString("not linked")
+		} else {
+			contact := contacts[0]
+			builder.WriteString("linked ")
+			builder.WriteString(formatWhatsAppPhoneForReply(contact.ContactJID))
+			builder.WriteString(" - status: ")
+			builder.WriteString(firstNonEmpty(contact.AllowStatus, "unknown"))
+		}
+	}
 	return builder.String()
+}
+
+func formatWhatsAppPhoneForReply(jid string) string {
+	raw := strings.TrimSpace(jid)
+	if index := strings.Index(raw, "@"); index >= 0 {
+		raw = raw[:index]
+	}
+	var builder strings.Builder
+	for _, char := range raw {
+		if char >= '0' && char <= '9' {
+			builder.WriteRune(char)
+		}
+	}
+	if builder.Len() == 0 {
+		return "unknown"
+	}
+	return "+" + builder.String()
 }
 
 func dailyPromptLimitForUser(cfg config.Config, user models.User) int {
