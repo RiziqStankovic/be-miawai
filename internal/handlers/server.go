@@ -106,6 +106,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PATCH /v1/whatsapp/accounts/{id}", s.requireUser(s.updateWhatsAppAccount))
 	mux.HandleFunc("POST /v1/whatsapp/accounts/{id}/pairing-refresh", s.requireUser(s.refreshWhatsAppPairing))
 	mux.HandleFunc("DELETE /v1/whatsapp/accounts/{id}", s.requireUser(s.deleteWhatsAppAccount))
+	mux.HandleFunc("GET /v1/whatsapp/contacts", s.requireUser(s.listLinkedWhatsAppContacts))
+	mux.HandleFunc("DELETE /v1/whatsapp/contacts/{id}", s.requireUser(s.revokeLinkedWhatsAppContact))
 	mux.HandleFunc("POST /v1/whatsapp/link-codes", s.requireUser(s.createWhatsAppLinkCode))
 	mux.HandleFunc("GET /v1/admin/overview", s.requireUser(s.adminOverview))
 	mux.HandleFunc("GET /v1/admin/whatsapp/conversations", s.requireUser(s.adminWhatsAppConversations))
@@ -360,17 +362,27 @@ func (s *Server) passwordLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) writeUserSession(w http.ResponseWriter, user models.User) {
-	if err := s.sessions.SetSession(w, auth.SessionIdentity{
+	identity := auth.SessionIdentity{
 		UserID: user.ID,
 		Email:  user.Email,
 		Role:   user.Role,
 		Access: user.Access,
-	}); err != nil {
+	}
+	if err := s.sessions.SetSession(w, identity); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create session")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]models.User{"user": user})
+	token, err := s.sessions.SignSession(identity, 30*24*time.Hour)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to sign session")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token": token,
+		"user":  user,
+	})
 }
 
 func (s *Server) startTrial(w http.ResponseWriter, r *http.Request, user models.User) {
@@ -1093,7 +1105,12 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request, user models.
 	webResearchAllowed := false
 	if !isStatusCommand(message) {
 		var err error
-		webResearchAllowed, err = s.checkUserQuota(r.Context(), user, len(body.Images), body.Web)
+		webResearchAllowed, err = s.checkUserQuota(
+			r.Context(),
+			user,
+			len(body.Images),
+			body.Web && shouldUseWebResearchForMessage(message, body.SearchQuery),
+		)
 		if err != nil {
 			writeError(w, http.StatusPaymentRequired, err.Error())
 			return
@@ -3034,6 +3051,13 @@ func (s *Server) planWebResearch(ctx context.Context, settings models.RuntimeSet
 	if message == "" {
 		return webResearchPlan{Reason: "empty message"}
 	}
+	if overrideQuery != "" {
+		return webResearchPlan{
+			NeedsResearch: true,
+			Query:         overrideQuery,
+			Reason:        "explicit search query supplied",
+		}
+	}
 	if directURL := firstHTTPURL(message); directURL != "" {
 		return webResearchPlan{
 			NeedsResearch: true,
@@ -3041,55 +3065,20 @@ func (s *Server) planWebResearch(ctx context.Context, settings models.RuntimeSet
 			Reason:        "URL detected in user message",
 		}
 	}
-	if force {
-		return webResearchPlan{
-			NeedsResearch: true,
-			Query:         firstNonEmpty(overrideQuery, buildSearchQuery(message)),
-			Reason:        "forced by client",
-		}
-	}
 	if shouldForceSearch(message) {
 		return webResearchPlan{
 			NeedsResearch: true,
-			Query:         firstNonEmpty(overrideQuery, buildSearchQuery(message)),
+			Query:         buildSearchQuery(message),
 			Reason:        "search keyword detected",
 		}
+	}
+	if force {
+		return webResearchPlan{Reason: "web mode enabled but no search intent detected"}
 	}
 	if !s.cfg.WebResearchEnabled {
 		return webResearchPlan{Reason: "web research disabled"}
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-
-	response, err := s.aiClient.Chat(
-		ctx,
-		ai.RuntimeSettings{
-			Provider:     settings.Provider,
-			BaseURL:      settings.BaseURL,
-			APIKey:       settings.APIKey,
-			Model:        settings.Models.Active,
-			SystemPrompt: webResearchDecisionPrompt(),
-		},
-		[]map[string]string{{
-			"role":    "user",
-			"content": message,
-		}},
-	)
-	if err != nil {
-		log.Printf("chat web research planner failed error=%q", err.Error())
-		return webResearchPlan{Reason: "AI planner failed"}
-	}
-
-	decision := parseWebResearchDecision(response)
-	if !decision.NeedsResearch {
-		return webResearchPlan{Reason: firstNonEmpty(decision.Reason, "AI planner decided no search")}
-	}
-	return webResearchPlan{
-		NeedsResearch: true,
-		Query:         firstNonEmpty(overrideQuery, decision.Query, buildSearchQuery(message)),
-		Reason:        firstNonEmpty(decision.Reason, "AI planner requested search"),
-	}
+	return webResearchPlan{Reason: "no search intent detected"}
 }
 
 func webResearchDecisionPrompt() string {
@@ -3138,6 +3127,14 @@ func shouldForceSearch(text string) bool {
 		}
 	}
 	return false
+}
+
+func shouldUseWebResearchForMessage(message string, searchQuery string) bool {
+	if strings.TrimSpace(searchQuery) != "" {
+		return true
+	}
+	message = strings.TrimSpace(message)
+	return firstHTTPURL(message) != "" || shouldForceSearch(message)
 }
 
 func buildSearchQuery(text string) string {

@@ -91,7 +91,7 @@ func (c *Client) SearchAndRead(ctx context.Context, query string) (Report, error
 		return Report{}, errors.New("web research is disabled")
 	}
 
-	results, err := c.Search(ctx, query)
+	results, searchedQueries, err := c.searchWithFallbacks(ctx, query)
 	if err != nil {
 		return Report{}, err
 	}
@@ -102,6 +102,12 @@ func (c *Client) SearchAndRead(ctx context.Context, query string) (Report, error
 		Results:     results,
 		ResultCount: len(results),
 		SearxngURL:  c.cfg.SearxngURL,
+	}
+	if len(searchedQueries) > 1 {
+		report.Warnings = append(report.Warnings, "SearXNG returned no results for the first query; retried with: "+strings.Join(searchedQueries[1:], " | "))
+	}
+	if len(results) == 0 {
+		report.Warnings = append(report.Warnings, "SearXNG returned 0 results. Upstream search engines may be rate-limited, timed out, or blocked.")
 	}
 
 	log.Printf("[tool] SearXNG menemukan %d hasil", len(results))
@@ -137,6 +143,30 @@ func (c *Client) SearchAndRead(ctx context.Context, query string) (Report, error
 	return report, nil
 }
 
+func (c *Client) searchWithFallbacks(ctx context.Context, query string) ([]SearchResult, []string, error) {
+	queries := searchQueryFallbacks(query)
+	searched := make([]string, 0, len(queries))
+	var lastErr error
+	for index, candidate := range queries {
+		if index > 0 {
+			log.Printf("[searxng] retry with fallback query=%q", candidate)
+		}
+		searched = append(searched, candidate)
+		results, err := c.Search(ctx, candidate)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(results) > 0 || index == len(queries)-1 {
+			return results, searched, nil
+		}
+	}
+	if lastErr != nil {
+		return nil, searched, lastErr
+	}
+	return nil, searched, nil
+}
+
 func (c *Client) Search(ctx context.Context, query string) ([]SearchResult, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -157,7 +187,7 @@ func (c *Client) Search(ctx context.Context, query string) ([]SearchResult, erro
 	values := parsed.Query()
 	values.Set("q", query)
 	values.Set("format", "json")
-	values.Set("language", "en")
+	values.Set("language", "all")
 	parsed.RawQuery = values.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
@@ -304,7 +334,7 @@ func (c *Client) ReadURL(ctx context.Context, rawURL string) (Page, error) {
 }
 
 func FormatContext(report Report) string {
-	if len(report.Results) == 0 && len(report.Pages) == 0 {
+	if len(report.Results) == 0 && len(report.Pages) == 0 && len(report.Warnings) == 0 {
 		return ""
 	}
 
@@ -314,6 +344,17 @@ func FormatContext(report Report) string {
 		builder.WriteString("Query: ")
 		builder.WriteString(report.Query)
 		builder.WriteString("\n")
+	}
+	if len(report.Warnings) > 0 {
+		builder.WriteString("\nWARNINGS:\n")
+		for _, warning := range report.Warnings {
+			builder.WriteString("- ")
+			builder.WriteString(warning)
+			builder.WriteString("\n")
+		}
+	}
+	if len(report.Results) == 0 && len(report.Pages) == 0 {
+		builder.WriteString("\nNo web results or readable pages were available. Do not answer as if local tracker data was checked; tell the user the web search returned no usable sources and suggest trying again or giving a source URL.\n")
 	}
 	if len(report.Pages) > 0 {
 		builder.WriteString("\nOPENED PAGES WITH READABLE TEXT:\n")
@@ -431,6 +472,45 @@ func scoreResult(result SearchResult, terms []string) float64 {
 
 func shouldSkipContentFetch(rawURL string) bool {
 	return regexp.MustCompile(`(?i)youtube\.com|youtu\.be|instagram\.com|facebook\.com|tiktok\.com|x\.com|twitter\.com|linkedin\.com|pinterest\.com|reddit\.com`).MatchString(rawURL)
+}
+
+func searchQueryFallbacks(query string) []string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil
+	}
+	queries := []string{query}
+	lower := strings.ToLower(query)
+	if strings.Contains(lower, "emas") {
+		queries = append(queries,
+			"harga emas hari ini antam",
+			"harga emas hari ini pegadaian",
+			"harga emas Antam hari ini",
+			"gold price today Indonesia",
+		)
+	}
+	if strings.Contains(lower, "hari ini") {
+		queries = append(queries, strings.TrimSpace(strings.ReplaceAll(query, "hari ini", "")))
+	}
+
+	unique := make([]string, 0, len(queries))
+	seen := map[string]struct{}{}
+	for _, item := range queries {
+		item = strings.Join(strings.Fields(strings.TrimSpace(item)), " ")
+		key := strings.ToLower(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, item)
+	}
+	if len(unique) > 5 {
+		return unique[:5]
+	}
+	return unique
 }
 
 func canonicalResultURL(rawURL string) string {

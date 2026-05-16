@@ -318,6 +318,32 @@ func (s *Store) ListAllowedWhatsAppContacts(ctx context.Context, accountID strin
 	return contacts, rows.Err()
 }
 
+func (s *Store) ListLinkedWhatsAppContactsByUser(ctx context.Context, userID string) ([]models.WhatsAppContact, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT id, whatsapp_account_id, owner_user_id, contact_jid, display_name, COALESCE(linked_user_id, ''), COALESCE(default_conversation_id, ''), allow_status, verification_attempts, created_at, updated_at
+		 FROM whatsapp_contacts
+		 WHERE linked_user_id = $1 AND allow_status = 'allowed'
+		 ORDER BY updated_at DESC
+		 LIMIT 1`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	contacts := make([]models.WhatsAppContact, 0, 1)
+	for rows.Next() {
+		contact, err := scanWhatsAppContact(rows)
+		if err != nil {
+			return nil, err
+		}
+		contacts = append(contacts, contact)
+	}
+	return contacts, rows.Err()
+}
+
 func (s *Store) AllowWhatsAppContact(ctx context.Context, account models.WhatsAppAccount, phoneNumber string) (models.WhatsAppContact, error) {
 	phoneNumber = normalizePhoneNumber(phoneNumber)
 	if phoneNumber == "" {
@@ -365,6 +391,32 @@ func (s *Store) RemoveAllowedWhatsAppContact(ctx context.Context, accountID stri
 		 WHERE id = $1 AND whatsapp_account_id = $2`,
 		contactID,
 		accountID,
+	)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) RevokeLinkedWhatsAppContact(ctx context.Context, userID string, contactID string) error {
+	result, err := s.db.ExecContext(
+		ctx,
+		`UPDATE whatsapp_contacts
+		 SET allow_status = 'blocked',
+		     linked_user_id = NULL,
+		     default_conversation_id = NULL,
+		     verification_attempts = 0,
+		     updated_at = NOW()
+		 WHERE id = $1 AND linked_user_id = $2`,
+		contactID,
+		userID,
 	)
 	if err != nil {
 		return err
@@ -530,6 +582,19 @@ func (s *Store) CreateWhatsAppLinkCode(ctx context.Context, userID string, phone
 	if phoneNumber == "" {
 		return models.WhatsAppLinkCode{}, errors.New("phone number is required")
 	}
+	var linkedCount int
+	if err := s.db.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*)
+		 FROM whatsapp_contacts
+		 WHERE linked_user_id = $1 AND allow_status = 'allowed'`,
+		userID,
+	).Scan(&linkedCount); err != nil {
+		return models.WhatsAppLinkCode{}, err
+	}
+	if linkedCount > 0 {
+		return models.WhatsAppLinkCode{}, errors.New("only one WhatsApp number can be linked; revoke the current number first")
+	}
 	code, err := randomNumericCode(6)
 	if err != nil {
 		return models.WhatsAppLinkCode{}, err
@@ -646,6 +711,21 @@ func (s *Store) VerifyWhatsAppLinkCode(ctx context.Context, accountID string, co
 		 WHERE id = $1`,
 		link.ID,
 		contactJID,
+	)
+	if err != nil {
+		return "", false, 0, err
+	}
+	_, err = tx.ExecContext(
+		ctx,
+		`UPDATE whatsapp_contacts
+		 SET allow_status = 'blocked',
+		     linked_user_id = NULL,
+		     default_conversation_id = NULL,
+		     verification_attempts = 0,
+		     updated_at = NOW()
+		 WHERE linked_user_id = $1 AND id <> $2`,
+		link.UserID,
+		contactID,
 	)
 	if err != nil {
 		return "", false, 0, err

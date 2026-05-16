@@ -187,6 +187,35 @@ func (s *Server) createWhatsAppLinkCode(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, http.StatusCreated, map[string]models.WhatsAppLinkCode{"linkCode": link})
 }
 
+func (s *Server) listLinkedWhatsAppContacts(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessWhatsAppRead) {
+		writeError(w, http.StatusForbidden, "whatsapp access is not allowed for this role")
+		return
+	}
+	contacts, err := s.store.ListLinkedWhatsAppContactsByUser(r.Context(), user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load linked whatsapp contacts")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string][]models.WhatsAppContact{"contacts": contacts})
+}
+
+func (s *Server) revokeLinkedWhatsAppContact(w http.ResponseWriter, r *http.Request, user models.User) {
+	if !hasAccess(user, accessWhatsAppWrite) {
+		writeError(w, http.StatusForbidden, "whatsapp unlink is not allowed for this role")
+		return
+	}
+	if err := s.store.RevokeLinkedWhatsAppContact(r.Context(), user.ID, r.PathValue("id")); err != nil {
+		if database.IsNotFound(err) {
+			writeError(w, http.StatusNotFound, "linked whatsapp number not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to revoke whatsapp number")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (s *Server) adminWhatsAppConversations(w http.ResponseWriter, r *http.Request, user models.User) {
 	if !hasAccess(user, accessAdmin) || !hasAccess(user, accessWhatsAppRead) {
 		writeError(w, http.StatusForbidden, "admin whatsapp access is not allowed for this role")
