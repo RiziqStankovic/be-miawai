@@ -107,6 +107,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PUT /v1/runtime/settings", s.requireUser(s.updateRuntimeSettings))
 	mux.HandleFunc("POST /v1/runtime/settings/test", s.requireUser(s.testRuntimeSettings))
 	mux.HandleFunc("GET /v1/models", s.openAIModelsGateway)
+	mux.HandleFunc("POST /v1/models", s.openAIModelsGateway)
 	mux.HandleFunc("POST /v1/chat/completions", s.openAIChatCompletionsGateway)
 	mux.HandleFunc("GET /v1/usage/status", s.requireUser(s.usageStatus))
 	mux.HandleFunc("GET /v1/whatsapp/accounts", s.requireUser(s.listWhatsAppAccounts))

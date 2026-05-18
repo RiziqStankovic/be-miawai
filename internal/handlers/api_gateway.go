@@ -80,6 +80,11 @@ func (s *Server) openAIModelsGateway(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if r.Method != http.MethodGet {
+		writeGatewayModelsResponse(w, settings)
+		log.Printf("api gateway models local key_prefix=%s user=%s method=%s", identity.Key.KeyPrefix, identity.User.ID, r.Method)
+		return
+	}
 	s.proxySimpleGatewayRequest(w, r, identity, settings, "/models")
 }
 
@@ -181,14 +186,65 @@ func (s *Server) proxySimpleGatewayRequest(w http.ResponseWriter, r *http.Reques
 	copyGatewayHeaders(req.Header, r.Header, settings.APIKey)
 	resp, err := s.client.Do(req)
 	if err != nil {
+		if suffix == "/models" {
+			writeGatewayModelsResponse(w, settings)
+			log.Printf("api gateway models local_fallback key_prefix=%s user=%s error=%q", identity.Key.KeyPrefix, identity.User.ID, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
 	defer resp.Body.Close()
+	if suffix == "/models" && resp.StatusCode >= 400 {
+		writeGatewayModelsResponse(w, settings)
+		log.Printf("api gateway models local_fallback key_prefix=%s user=%s status=%d", identity.Key.KeyPrefix, identity.User.ID, resp.StatusCode)
+		return
+	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 	log.Printf("api gateway models key_prefix=%s user=%s status=%d", identity.Key.KeyPrefix, identity.User.ID, resp.StatusCode)
+}
+
+func writeGatewayModelsResponse(w http.ResponseWriter, settings models.RuntimeSettings) {
+	models := gatewayModelIDs(settings)
+	data := make([]map[string]any, 0, len(models))
+	for _, model := range models {
+		data = append(data, map[string]any{
+			"id":       model,
+			"object":   "model",
+			"owned_by": "miaw",
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"object": "list",
+		"data":   data,
+	})
+}
+
+func gatewayModelIDs(settings models.RuntimeSettings) []string {
+	seen := map[string]struct{}{}
+	models := make([]string, 0, len(settings.Models.All)+2)
+	add := func(model string) {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			return
+		}
+		if _, ok := seen[model]; ok {
+			return
+		}
+		seen[model] = struct{}{}
+		models = append(models, model)
+	}
+	add(settings.Models.Active)
+	for _, model := range settings.Models.All {
+		add(model)
+	}
+	add("customai-tunning")
+	if len(models) == 0 {
+		add("gpt-4o-mini")
+	}
+	return models
 }
 
 func (s *Server) proxyJSONChatGateway(w http.ResponseWriter, r *http.Request, identity apiGatewayIdentity, settings models.RuntimeSettings, body []byte, model string) {
