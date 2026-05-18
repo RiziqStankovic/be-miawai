@@ -131,6 +131,17 @@ type RuntimeSettings struct {
 	Models       RuntimeModels `json:"models"`
 }
 
+type UserAPIKey struct {
+	ID         string     `json:"id"`
+	UserID     string     `json:"userId"`
+	Name       string     `json:"name"`
+	KeyPrefix  string     `json:"keyPrefix"`
+	Status     string     `json:"status"`
+	LastUsedAt *time.Time `json:"lastUsedAt"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	RevokedAt  *time.Time `json:"revokedAt"`
+}
+
 type Conversation struct {
 	ID                 string    `json:"id"`
 	Title              string    `json:"title"`

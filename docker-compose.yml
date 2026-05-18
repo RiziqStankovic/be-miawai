@@ -16,3 +16,10 @@ services:
       - SETUID
     security_opt:
       - no-new-privileges:true
+  lightpanda:
+    image: lightpanda/browser:nightly
+    container_name: lightpanda
+    command: ["lightpanda", "serve", "--host", "0.0.0.0", "--port", "9222", "--log_level", "debug"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9222:9222" 

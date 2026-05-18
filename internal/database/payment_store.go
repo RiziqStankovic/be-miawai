@@ -103,7 +103,15 @@ func (s *Store) GetSettledCreditPurchaseUSD(ctx context.Context, userID string) 
 
 func (s *Store) IncrementDailyUsage(ctx context.Context, userID string, tokenInput int, tokenOutput int, imageCount int, researchCount int) error {
 	usageDate := dailyUsageDate()
-	_, err := s.db.ExecContext(
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	_, err = tx.ExecContext(
 		ctx,
 		`INSERT INTO user_daily_usage (user_id, usage_date, prompt_count, image_count, research_count, token_input, token_output)
 		 VALUES ($1, $2, 1, $3, $4, $5, $6)
@@ -123,7 +131,7 @@ func (s *Store) IncrementDailyUsage(ctx context.Context, userID string, tokenInp
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(
+	_, err = tx.ExecContext(
 		ctx,
 		`INSERT INTO user_usage_events (id, user_id, token_input, token_output, image_count, research_count)
 		 VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -134,7 +142,10 @@ func (s *Store) IncrementDailyUsage(ctx context.Context, userID string, tokenInp
 		imageCount,
 		researchCount,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) GetDailyUsage(ctx context.Context, userID string) (models.UserDailyUsage, error) {

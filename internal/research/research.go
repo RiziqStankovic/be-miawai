@@ -64,8 +64,8 @@ func NewClient(cfg Config) *Client {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 12 * time.Second
 	}
-	if cfg.MaxResults <= 0 || cfg.MaxResults > 10 {
-		cfg.MaxResults = 5
+	if cfg.MaxResults <= 0 || cfg.MaxResults > 20 {
+		cfg.MaxResults = 20
 	}
 	if cfg.TargetPages <= 0 || cfg.TargetPages > 5 {
 		cfg.TargetPages = 2

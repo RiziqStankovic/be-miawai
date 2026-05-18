@@ -100,9 +100,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/auth/token-exchange", s.tokenExchange)
 	mux.HandleFunc("POST /v1/auth/logout", s.logout)
 	mux.HandleFunc("GET /v1/me", s.requireUser(s.me))
+	mux.HandleFunc("GET /v1/api-keys", s.requireUser(s.listAPIKeys))
+	mux.HandleFunc("POST /v1/api-keys", s.requireUser(s.createAPIKey))
+	mux.HandleFunc("DELETE /v1/api-keys/{id}", s.requireUser(s.revokeAPIKey))
 	mux.HandleFunc("GET /v1/runtime/settings", s.requireUser(s.runtimeSettings))
 	mux.HandleFunc("PUT /v1/runtime/settings", s.requireUser(s.updateRuntimeSettings))
 	mux.HandleFunc("POST /v1/runtime/settings/test", s.requireUser(s.testRuntimeSettings))
+	mux.HandleFunc("GET /v1/models", s.openAIModelsGateway)
+	mux.HandleFunc("POST /v1/chat/completions", s.openAIChatCompletionsGateway)
 	mux.HandleFunc("GET /v1/usage/status", s.requireUser(s.usageStatus))
 	mux.HandleFunc("GET /v1/whatsapp/accounts", s.requireUser(s.listWhatsAppAccounts))
 	mux.HandleFunc("POST /v1/whatsapp/accounts", s.requireUser(s.createWhatsAppAccount))
@@ -150,6 +155,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/checkout/create", s.requireUser(s.createCheckout))
 	mux.HandleFunc("POST /v1/checkout/sync", s.requireUser(s.syncCheckout))
 	mux.HandleFunc("POST /v1/subscriptions/verify-android", s.requireUser(s.verifyAndroidPurchase))
+	mux.HandleFunc("/v1/{path...}", s.openAIUnsupportedGateway)
 	return s.withRequestLogging(mux)
 }
 
@@ -1623,7 +1629,9 @@ func (s *Server) processChatReply(ctx context.Context, input chatReplyInput) (ch
 	if webAttempted && webResearchError == "" {
 		researchCount = 1
 	}
-	_ = s.store.IncrementDailyUsage(ctx, input.User.ID, usage.PromptTokens, usage.CompletionTokens, len(input.SavedImages), researchCount)
+	if err := s.store.IncrementDailyUsage(ctx, input.User.ID, usage.PromptTokens, usage.CompletionTokens, len(input.SavedImages), researchCount); err != nil {
+		log.Printf("chat usage tracking failed user=%s input_tokens=%d output_tokens=%d images=%d research=%d error=%q", input.User.ID, usage.PromptTokens, usage.CompletionTokens, len(input.SavedImages), researchCount, err.Error())
+	}
 
 	assistantMessage := newConversationMessage(input.Conversation.ID, "assistant", assistantText)
 	if webReport != nil && webResearchError == "" {
@@ -3158,9 +3166,9 @@ func buildUsageCreditStatus(initialCreditUSD float64, usedTokens int, costUSDPer
 		used = (float64(usedTokens) / 1000) * costUSDPer1KTokens
 	}
 	return usageCreditStatus{
-		Initial:   roundCurrency(maxFloat(0, initialCreditUSD)),
-		Used:      roundCurrency(maxFloat(0, used)),
-		Remaining: roundCurrency(maxFloat(0, initialCreditUSD-used)),
+		Initial:   roundUsageCreditUSD(maxFloat(0, initialCreditUSD)),
+		Used:      roundUsageCreditUSD(maxFloat(0, used)),
+		Remaining: roundUsageCreditUSD(maxFloat(0, initialCreditUSD-used)),
 	}
 }
 
@@ -3187,6 +3195,10 @@ func (s *Server) hasRemainingWeeklyUsageCredit(ctx context.Context, user models.
 
 func roundCurrency(value float64) float64 {
 	return math.Round(value*100) / 100
+}
+
+func roundUsageCreditUSD(value float64) float64 {
+	return math.Round(value*1000000) / 1000000
 }
 
 func maxFloat(left float64, right float64) float64 {

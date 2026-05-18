@@ -131,7 +131,7 @@ func Load() Config {
 		WebResearchEnabled:         getenv("WEB_RESEARCH_ENABLED", "false") == "true",
 		SearxngURL:                 strings.TrimRight(getenv("SEARXNG_URL", "http://127.0.0.1:25017"), "/"),
 		WebResearchTimeoutMs:       parseInt(getenv("WEB_RESEARCH_TIMEOUT_MS", "12000"), 12000),
-		WebResearchMaxResults:      parseInt(getenv("WEB_RESEARCH_MAX_RESULTS", "5"), 5),
+		WebResearchMaxResults:      parseInt(getenv("WEB_RESEARCH_MAX_RESULTS", "20"), 20),
 		WebResearchTargetPages:     parseInt(getenv("WEB_RESEARCH_TARGET_PAGES", "2"), 2),
 		WebResearchMaxContentChars: parseInt(getenv("WEB_RESEARCH_MAX_CONTENT_CHARS", "6000"), 6000),
 
