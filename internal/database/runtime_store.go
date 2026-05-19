@@ -365,7 +365,7 @@ func normalizeModelList(active string, models []string) []string {
 	}
 
 	if len(normalized) == 0 {
-		normalized = append(normalized, "gpt-4o-mini")
+		normalized = append(normalized, "customai-tunning")
 	}
 
 	return normalized

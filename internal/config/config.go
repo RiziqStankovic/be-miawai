@@ -91,7 +91,7 @@ func Load() Config {
 		DefaultProvider:           getenv("THUKI_PROVIDER", "openai"),
 		DefaultProviderBaseURL:    getenv("THUKI_API_BASE_URL", ""),
 		DefaultProviderAPIKey:     strings.TrimSpace(os.Getenv("THUKI_API_KEY")),
-		DefaultProviderModels:     splitCSV(getenv("THUKI_SUPPORTED_AI_MODELS", "gpt-4o-mini")),
+		DefaultProviderModels:     splitCSV(getenv("THUKI_SUPPORTED_AI_MODELS", "customai-tunning")),
 		DefaultProviderSystem:     strings.TrimSpace(os.Getenv("THUKI_SYSTEM_PROMPT")),
 		SessionSecret:             getenv("SESSION_SECRET", "dev-only-change-me"),
 		CookieSecure:              getenv("COOKIE_SECURE", "false") == "true",

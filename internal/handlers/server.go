@@ -1348,7 +1348,7 @@ func (s *Server) chatStream(w http.ResponseWriter, r *http.Request, user models.
 		if s.cfg.ManagedAIApiKey != "" {
 			settings.APIKey = s.cfg.ManagedAIApiKey
 			if user.Plan != "pro" {
-				settings.Models.Active = "gpt-4o-mini" // Force cheaper model for free tier
+				settings.Models.Active = managedFreeTierModel
 			}
 		}
 	}

@@ -19,10 +19,10 @@ func TestNormalizeGatewayChatBodyForFreeUserForcesModelAndUsage(t *testing.T) {
 	if !stream {
 		t.Fatal("stream = false, want true")
 	}
-	if model != "gpt-4o-mini" {
-		t.Fatalf("model = %q, want forced gpt-4o-mini", model)
+	if model != managedFreeTierModel {
+		t.Fatalf("model = %q, want forced %s", model, managedFreeTierModel)
 	}
-	if string(body) == "" || !containsAll(string(body), `"model":"gpt-4o-mini"`, `"include_usage":true`) {
+	if string(body) == "" || !containsAll(string(body), `"model":"`+managedFreeTierModel+`"`, `"include_usage":true`) {
 		t.Fatalf("normalized body missing forced model/include_usage: %s", string(body))
 	}
 }

@@ -581,7 +581,7 @@ func (s *Server) processWhatsAppMessage(ctx context.Context, user models.User, a
 	if strings.TrimSpace(settings.APIKey) == "" && s.cfg.ManagedAIApiKey != "" {
 		settings.APIKey = s.cfg.ManagedAIApiKey
 		if user.Plan != "pro" {
-			settings.Models.Active = "gpt-4o-mini"
+			settings.Models.Active = managedFreeTierModel
 		}
 	}
 	if strings.TrimSpace(settings.BaseURL) == "" || strings.TrimSpace(settings.Models.Active) == "" || strings.TrimSpace(settings.APIKey) == "" {

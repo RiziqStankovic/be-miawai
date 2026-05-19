@@ -171,7 +171,7 @@ func (s *Server) gatewayRuntimeSettings(w http.ResponseWriter, user models.User)
 		return models.RuntimeSettings{}, false
 	}
 	if user.Plan != "pro" {
-		settings.Models.Active = "gpt-4o-mini"
+		settings.Models.Active = managedFreeTierModel
 	}
 	return settings, true
 }
@@ -241,9 +241,6 @@ func gatewayModelIDs(settings models.RuntimeSettings) []string {
 		add(model)
 	}
 	add("customai-tunning")
-	if len(models) == 0 {
-		add("gpt-4o-mini")
-	}
 	return models
 }
 
@@ -367,7 +364,7 @@ func normalizeGatewayChatBody(rawBody []byte, user models.User) ([]byte, bool, s
 	model, _ := payload["model"].(string)
 	model = strings.TrimSpace(model)
 	if user.Plan != "pro" {
-		model = "gpt-4o-mini"
+		model = managedFreeTierModel
 		payload["model"] = model
 	}
 	stream, _ := payload["stream"].(bool)
