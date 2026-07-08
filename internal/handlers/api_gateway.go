@@ -124,6 +124,42 @@ func (s *Server) openAIChatCompletionsGateway(w http.ResponseWriter, r *http.Req
 	s.proxyJSONChatGateway(w, r, identity, settings, body, model)
 }
 
+func (s *Server) openAIResponsesGateway(w http.ResponseWriter, r *http.Request) {
+	identity, ok := s.authenticateGatewayRequest(w, r)
+	if !ok {
+		return
+	}
+	settings, ok := s.gatewayRuntimeSettings(w, identity.User)
+	if !ok {
+		return
+	}
+	hasCredit, err := s.hasRemainingWeeklyUsageCredit(r.Context(), identity.User)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to check usage credit")
+		return
+	}
+	if !hasCredit {
+		writeError(w, http.StatusPaymentRequired, "usage credit is exhausted")
+		return
+	}
+
+	rawBody, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	body, stream, model, err := normalizeGatewayResponsesBody(rawBody, identity.User)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if stream {
+		s.proxyStreamingResponsesGateway(w, r, identity, settings, body, model)
+		return
+	}
+	s.proxyJSONResponsesGateway(w, r, identity, settings, body, model)
+}
+
 func (s *Server) openAIUnsupportedGateway(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/v1/") {
 		if _, ok := s.authenticateGatewayRequest(w, r); !ok {
@@ -245,12 +281,17 @@ func gatewayModelIDs(settings models.RuntimeSettings) []string {
 }
 
 func (s *Server) proxyJSONChatGateway(w http.ResponseWriter, r *http.Request, identity apiGatewayIdentity, settings models.RuntimeSettings, body []byte, model string) {
-	respBody, status, headers, err := s.doGatewayChatRequest(r.Context(), r.Header, settings, body)
+	respBody, status, headers, err := s.doGatewayRequest(r.Context(), r.Header, settings, "/chat/completions", body)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	if status >= 300 {
+		if isUpstreamBudgetExceeded(respBody) {
+			writeOpenAIError(w, http.StatusPaymentRequired, "managed AI provider budget is exhausted", "insufficient_quota")
+			log.Printf("api gateway chat upstream_budget_exhausted key_prefix=%s user=%s model=%s status=%d body=%s", identity.Key.KeyPrefix, identity.User.ID, model, status, logValue(string(respBody), 240))
+			return
+		}
 		writeGatewayRawResponse(w, status, headers, respBody)
 		log.Printf("api gateway chat upstream_error key_prefix=%s user=%s model=%s status=%d body=%s", identity.Key.KeyPrefix, identity.User.ID, model, status, logValue(string(respBody), 240))
 		return
@@ -263,6 +304,34 @@ func (s *Server) proxyJSONChatGateway(w http.ResponseWriter, r *http.Request, id
 	}
 	if err := s.recordGatewayUsage(r.Context(), identity, usage, model, status); err != nil {
 		log.Printf("api gateway usage tracking failed key_prefix=%s user=%s model=%s error=%q", identity.Key.KeyPrefix, identity.User.ID, model, err.Error())
+	}
+	writeGatewayRawResponse(w, status, headers, respBody)
+}
+
+func (s *Server) proxyJSONResponsesGateway(w http.ResponseWriter, r *http.Request, identity apiGatewayIdentity, settings models.RuntimeSettings, body []byte, model string) {
+	respBody, status, headers, err := s.doGatewayRequest(r.Context(), r.Header, settings, "/responses", body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if status >= 300 {
+		if isUpstreamBudgetExceeded(respBody) {
+			writeOpenAIError(w, http.StatusPaymentRequired, "managed AI provider budget is exhausted", "insufficient_quota")
+			log.Printf("api gateway responses upstream_budget_exhausted key_prefix=%s user=%s model=%s status=%d body=%s", identity.Key.KeyPrefix, identity.User.ID, model, status, logValue(string(respBody), 240))
+			return
+		}
+		writeGatewayRawResponse(w, status, headers, respBody)
+		log.Printf("api gateway responses upstream_error key_prefix=%s user=%s model=%s status=%d body=%s", identity.Key.KeyPrefix, identity.User.ID, model, status, logValue(string(respBody), 240))
+		return
+	}
+	usage, ok := parseResponsesUsageFromJSON(respBody)
+	if !ok {
+		writeOpenAIError(w, http.StatusNotImplemented, "upstream response did not include billable usage", "unsupported_unmetered_response")
+		log.Printf("api gateway responses missing_usage key_prefix=%s user=%s model=%s status=%d", identity.Key.KeyPrefix, identity.User.ID, model, status)
+		return
+	}
+	if err := s.recordGatewayUsage(r.Context(), identity, usage, model, status); err != nil {
+		log.Printf("api gateway responses usage tracking failed key_prefix=%s user=%s model=%s error=%q", identity.Key.KeyPrefix, identity.User.ID, model, err.Error())
 	}
 	writeGatewayRawResponse(w, status, headers, respBody)
 }
@@ -283,12 +352,18 @@ func (s *Server) proxyStreamingChatGateway(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	defer resp.Body.Close()
-	copyResponseHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
 
 	if resp.StatusCode >= 300 {
 		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if isUpstreamBudgetExceeded(payload) {
+			writeOpenAIError(w, http.StatusPaymentRequired, "managed AI provider budget is exhausted", "insufficient_quota")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			log.Printf("api gateway stream upstream_budget_exhausted key_prefix=%s user=%s model=%s status=%d body=%s", identity.Key.KeyPrefix, identity.User.ID, model, resp.StatusCode, logValue(string(payload), 240))
+			return
+		}
 		_, _ = w.Write(payload)
 		if flusher != nil {
 			flusher.Flush()
@@ -296,6 +371,9 @@ func (s *Server) proxyStreamingChatGateway(w http.ResponseWriter, r *http.Reques
 		log.Printf("api gateway stream upstream_error key_prefix=%s user=%s model=%s status=%d body=%s", identity.Key.KeyPrefix, identity.User.ID, model, resp.StatusCode, logValue(string(payload), 240))
 		return
 	}
+
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
 
 	reader := bufio.NewReader(resp.Body)
 	var usage ai.TokenUsage
@@ -324,8 +402,74 @@ func (s *Server) proxyStreamingChatGateway(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-func (s *Server) doGatewayChatRequest(ctx context.Context, headers http.Header, settings models.RuntimeSettings, body []byte) ([]byte, int, http.Header, error) {
-	endpoint := strings.TrimRight(settings.BaseURL, "/") + "/chat/completions"
+func (s *Server) proxyStreamingResponsesGateway(w http.ResponseWriter, r *http.Request, identity apiGatewayIdentity, settings models.RuntimeSettings, body []byte, model string) {
+	endpoint := strings.TrimRight(settings.BaseURL, "/") + "/responses"
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to build upstream request")
+		return
+	}
+	copyGatewayHeaders(req.Header, r.Header, settings.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "upstream request failed")
+		return
+	}
+	defer resp.Body.Close()
+	flusher, _ := w.(http.Flusher)
+
+	if resp.StatusCode >= 300 {
+		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if isUpstreamBudgetExceeded(payload) {
+			writeOpenAIError(w, http.StatusPaymentRequired, "managed AI provider budget is exhausted", "insufficient_quota")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			log.Printf("api gateway responses stream upstream_budget_exhausted key_prefix=%s user=%s model=%s status=%d body=%s", identity.Key.KeyPrefix, identity.User.ID, model, resp.StatusCode, logValue(string(payload), 240))
+			return
+		}
+		_, _ = w.Write(payload)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		log.Printf("api gateway responses stream upstream_error key_prefix=%s user=%s model=%s status=%d body=%s", identity.Key.KeyPrefix, identity.User.ID, model, resp.StatusCode, logValue(string(payload), 240))
+		return
+	}
+
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+
+	reader := bufio.NewReader(resp.Body)
+	var usage ai.TokenUsage
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			parseResponsesUsageFromSSELine(line, &usage)
+			_, _ = w.Write(line)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				log.Printf("api gateway responses stream read failed key_prefix=%s user=%s model=%s error=%q", identity.Key.KeyPrefix, identity.User.ID, model, readErr.Error())
+			}
+			break
+		}
+	}
+	if usage.TotalTokens == 0 && usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+		log.Printf("api gateway responses stream missing_usage key_prefix=%s user=%s model=%s status=%d", identity.Key.KeyPrefix, identity.User.ID, model, resp.StatusCode)
+		return
+	}
+	if err := s.recordGatewayUsage(context.Background(), identity, usage, model, resp.StatusCode); err != nil {
+		log.Printf("api gateway responses stream usage tracking failed key_prefix=%s user=%s model=%s error=%q", identity.Key.KeyPrefix, identity.User.ID, model, err.Error())
+	}
+}
+
+func (s *Server) doGatewayRequest(ctx context.Context, headers http.Header, settings models.RuntimeSettings, suffix string, body []byte) ([]byte, int, http.Header, error) {
+	endpoint := strings.TrimRight(settings.BaseURL, "/") + suffix
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, nil, err
@@ -383,6 +527,28 @@ func normalizeGatewayChatBody(rawBody []byte, user models.User) ([]byte, bool, s
 	return body, stream, model, nil
 }
 
+func normalizeGatewayResponsesBody(rawBody []byte, user models.User) ([]byte, bool, string, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(rawBody, &payload); err != nil {
+		return nil, false, "", errors.New("invalid json body")
+	}
+	if _, ok := payload["input"]; !ok {
+		return nil, false, "", errors.New("input is required")
+	}
+	model, _ := payload["model"].(string)
+	model = strings.TrimSpace(model)
+	if user.Plan != "pro" {
+		model = managedFreeTierModel
+		payload["model"] = model
+	}
+	stream, _ := payload["stream"].(bool)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, "", err
+	}
+	return body, stream, model, nil
+}
+
 func parseOpenAIUsageFromJSON(body []byte) (ai.TokenUsage, bool) {
 	var payload struct {
 		Usage *struct {
@@ -401,6 +567,24 @@ func parseOpenAIUsageFromJSON(body []byte) (ai.TokenUsage, bool) {
 	}, true
 }
 
+func parseResponsesUsageFromJSON(body []byte) (ai.TokenUsage, bool) {
+	var payload struct {
+		Usage *struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+			TotalTokens  int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Usage == nil {
+		return ai.TokenUsage{}, false
+	}
+	return ai.TokenUsage{
+		PromptTokens:     payload.Usage.InputTokens,
+		CompletionTokens: payload.Usage.OutputTokens,
+		TotalTokens:      payload.Usage.TotalTokens,
+	}, true
+}
+
 func parseOpenAIUsageFromSSELine(line []byte, usage *ai.TokenUsage) {
 	trimmed := strings.TrimSpace(string(line))
 	if !strings.HasPrefix(trimmed, "data: ") {
@@ -413,6 +597,62 @@ func parseOpenAIUsageFromSSELine(line []byte, usage *ai.TokenUsage) {
 	if parsed, ok := parseOpenAIUsageFromJSON([]byte(data)); ok {
 		*usage = parsed
 	}
+}
+
+func parseResponsesUsageFromSSELine(line []byte, usage *ai.TokenUsage) {
+	trimmed := strings.TrimSpace(string(line))
+	if !strings.HasPrefix(trimmed, "data: ") {
+		return
+	}
+	data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data: "))
+	if data == "" || data == "[DONE]" {
+		return
+	}
+	if parsed, ok := parseResponsesUsageFromJSON([]byte(data)); ok {
+		*usage = parsed
+		return
+	}
+	var event struct {
+		Response json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(data), &event); err != nil || len(event.Response) == 0 {
+		return
+	}
+	if parsed, ok := parseResponsesUsageFromJSON(event.Response); ok {
+		*usage = parsed
+	}
+}
+
+func isUpstreamBudgetExceeded(body []byte) bool {
+	message := strings.ToLower(strings.TrimSpace(string(body)))
+	if message == "" {
+		return false
+	}
+
+	var payload struct {
+		Error any `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) == nil && payload.Error != nil {
+		switch value := payload.Error.(type) {
+		case string:
+			message = strings.ToLower(value)
+		case map[string]any:
+			parts := []string{}
+			for _, key := range []string{"message", "type", "code"} {
+				if text, ok := value[key].(string); ok {
+					parts = append(parts, text)
+				}
+			}
+			if len(parts) > 0 {
+				message = strings.ToLower(strings.Join(parts, " "))
+			}
+		}
+	}
+
+	return strings.Contains(message, "budget has been exceeded") ||
+		strings.Contains(message, "max budget") ||
+		strings.Contains(message, "insufficient_quota") ||
+		strings.Contains(message, "quota exceeded")
 }
 
 func copyGatewayHeaders(dst http.Header, src http.Header, apiKey string) {
