@@ -220,7 +220,7 @@ func (s *Server) proxySimpleGatewayRequest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	copyGatewayHeaders(req.Header, r.Header, settings.APIKey)
-	resp, err := s.client.Do(req)
+	resp, err := s.gatewayClient.Do(req)
 	if err != nil {
 		if suffix == "/models" {
 			writeGatewayModelsResponse(w, settings)
@@ -346,7 +346,7 @@ func (s *Server) proxyStreamingChatGateway(w http.ResponseWriter, r *http.Reques
 	copyGatewayHeaders(req.Header, r.Header, settings.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := s.client.Do(req)
+	resp, err := s.gatewayClient.Do(req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream request failed")
 		return
@@ -412,7 +412,7 @@ func (s *Server) proxyStreamingResponsesGateway(w http.ResponseWriter, r *http.R
 	copyGatewayHeaders(req.Header, r.Header, settings.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := s.client.Do(req)
+	resp, err := s.gatewayClient.Do(req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream request failed")
 		return
@@ -476,7 +476,7 @@ func (s *Server) doGatewayRequest(ctx context.Context, headers http.Header, sett
 	}
 	copyGatewayHeaders(req.Header, headers, settings.APIKey)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
+	resp, err := s.gatewayClient.Do(req)
 	if err != nil {
 		return nil, 0, nil, err
 	}

@@ -42,6 +42,7 @@ type Server struct {
 	sessions        *auth.Manager
 	guests          *auth.GuestManager
 	client          *http.Client
+	gatewayClient   *http.Client
 	aiClient        *ai.Client
 	research        *research.Client
 	chatStorage     storage.CloudStorage
@@ -57,11 +58,15 @@ type errorResponse struct {
 
 func NewServer(cfg config.Config, store *database.Store) *Server {
 	server := &Server{
-		cfg:      cfg,
-		store:    store,
-		sessions: auth.NewManager(cfg.SessionSecret, cfg.CookieSecure),
-		guests:   auth.NewGuestManager(cfg.SessionSecret, cfg.CookieSecure),
-		client:   &http.Client{Timeout: 12 * time.Second},
+		cfg:           cfg,
+		store:         store,
+		sessions:      auth.NewManager(cfg.SessionSecret, cfg.CookieSecure),
+		guests:        auth.NewGuestManager(cfg.SessionSecret, cfg.CookieSecure),
+		client:        &http.Client{Timeout: 12 * time.Second},
+		gatewayClient: &http.Client{
+			// Gateway requests can be long-lived SSE streams. Do not set a total
+			// client timeout here; cancellation should come from the caller's request.
+		},
 		aiClient: ai.NewClient(),
 		research: research.NewClient(research.Config{
 			Enabled:         cfg.WebResearchEnabled,

@@ -3,10 +3,26 @@ package handlers
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"be-miawai/internal/ai"
+	"be-miawai/internal/config"
 	"be-miawai/internal/models"
 )
+
+func TestNewServerUsesNoTotalTimeoutForGatewayClient(t *testing.T) {
+	server := NewServer(config.Config{}, nil)
+
+	if server.gatewayClient == nil {
+		t.Fatal("gatewayClient is nil")
+	}
+	if server.gatewayClient.Timeout != 0 {
+		t.Fatalf("gatewayClient timeout = %s, want no total timeout", server.gatewayClient.Timeout)
+	}
+	if server.client.Timeout != 12*time.Second {
+		t.Fatalf("default client timeout = %s, want 12s", server.client.Timeout)
+	}
+}
 
 func TestNormalizeGatewayChatBodyForFreeUserForcesModelAndUsage(t *testing.T) {
 	body, stream, model, err := normalizeGatewayChatBody(
