@@ -76,6 +76,13 @@ type Config struct {
 	AdminBootstrapEmail    string
 	AdminBootstrapName     string
 	AdminBootstrapPassword string
+
+	ResendAPIKey    string
+	ResendFromEmail string
+	ResendFromName  string
+	ResendEnabled   bool
+	EmailOTPEnabled bool
+	EmailOTPTTLMin  int
 }
 
 func Load() Config {
@@ -145,6 +152,13 @@ func Load() Config {
 		AdminBootstrapEmail:    getenv("ADMIN_BOOTSTRAP_EMAIL", "admin@miaw.local"),
 		AdminBootstrapName:     getenv("ADMIN_BOOTSTRAP_NAME", "Miaw Admin"),
 		AdminBootstrapPassword: getenv("ADMIN_BOOTSTRAP_PASSWORD", "admin123"),
+
+		ResendAPIKey:    strings.TrimSpace(os.Getenv("RESEND_API_KEY")),
+		ResendFromEmail: getenv("RESEND_FROM_EMAIL", "noreply@salome2.cloudfren.id"),
+		ResendFromName:  getenv("RESEND_FROM_NAME", "SALOME Platform"),
+		ResendEnabled:   getenv("RESEND_ENABLED", "false") == "true",
+		EmailOTPEnabled: getenv("EMAIL_OTP_ENABLED", "true") == "true",
+		EmailOTPTTLMin:  parseInt(getenv("EMAIL_OTP_TTL_MIN", "10"), 10),
 	}
 }
 

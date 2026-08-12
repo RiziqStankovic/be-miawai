@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -20,10 +21,21 @@ type Store struct {
 }
 
 var ErrEmailAlreadyExists = errors.New("email already exists")
+var ErrEmailOTPInvalid = errors.New("email otp is invalid or expired")
 
 type PasswordAccount struct {
 	User         models.User
 	PasswordHash string
+}
+
+type PendingEmailOTP struct {
+	ID           string
+	Email        string
+	Name         string
+	PasswordHash string
+	CodeHash     string
+	Attempts     int
+	ExpiresAt    time.Time
 }
 
 var ErrDesktopAuthCodeInvalid = errors.New("desktop auth code is invalid or expired")
@@ -46,6 +58,130 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+func (s *Store) CreateEmailOTP(ctx context.Context, email string, name string, passwordHash string, codeHash string, ttl time.Duration) (PendingEmailOTP, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	name = strings.TrimSpace(name)
+	if email == "" {
+		return PendingEmailOTP{}, errors.New("email is required")
+	}
+	if name == "" {
+		name = strings.Split(email, "@")[0]
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+
+	var existingID string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM users WHERE email = $1`, email).Scan(&existingID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return PendingEmailOTP{}, err
+	}
+	if err == nil {
+		return PendingEmailOTP{}, ErrEmailAlreadyExists
+	}
+
+	otp := PendingEmailOTP{
+		ID:           newID("otp"),
+		Email:        email,
+		Name:         name,
+		PasswordHash: passwordHash,
+		CodeHash:     codeHash,
+		ExpiresAt:    time.Now().UTC().Add(ttl),
+	}
+	_, err = s.db.ExecContext(
+		ctx,
+		`INSERT INTO email_otps (id, email, name, password_hash, code_hash, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		otp.ID,
+		otp.Email,
+		otp.Name,
+		otp.PasswordHash,
+		otp.CodeHash,
+		otp.ExpiresAt,
+	)
+	if err != nil {
+		return PendingEmailOTP{}, err
+	}
+	return otp, nil
+}
+
+func (s *Store) ConsumeEmailOTP(ctx context.Context, email string, codeHash string, maxAttempts int) (models.User, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	codeHash = strings.TrimSpace(codeHash)
+	if email == "" || codeHash == "" {
+		return models.User{}, ErrEmailOTPInvalid
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return models.User{}, err
+	}
+	defer tx.Rollback()
+
+	var otp PendingEmailOTP
+	err = tx.QueryRowContext(
+		ctx,
+		`SELECT id, email, name, password_hash, code_hash, attempts, expires_at
+		 FROM email_otps
+		 WHERE email = $1 AND consumed_at IS NULL AND expires_at > NOW()
+		 ORDER BY created_at DESC
+		 LIMIT 1
+		 FOR UPDATE`,
+		email,
+	).Scan(&otp.ID, &otp.Email, &otp.Name, &otp.PasswordHash, &otp.CodeHash, &otp.Attempts, &otp.ExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return models.User{}, ErrEmailOTPInvalid
+	}
+	if err != nil {
+		return models.User{}, err
+	}
+	if otp.Attempts >= maxAttempts {
+		return models.User{}, ErrEmailOTPInvalid
+	}
+	if !hmac.Equal([]byte(otp.CodeHash), []byte(codeHash)) {
+		_, _ = tx.ExecContext(ctx, `UPDATE email_otps SET attempts = attempts + 1, updated_at = NOW() WHERE id = $1`, otp.ID)
+		if commitErr := tx.Commit(); commitErr != nil {
+			return models.User{}, commitErr
+		}
+		return models.User{}, ErrEmailOTPInvalid
+	}
+
+	var existingID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM users WHERE email = $1`, email).Scan(&existingID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return models.User{}, err
+	}
+	if err == nil {
+		return models.User{}, ErrEmailAlreadyExists
+	}
+
+	userID := newID("usr")
+	_, err = tx.ExecContext(ctx, `INSERT INTO users (id, email, name) VALUES ($1, $2, $3)`, userID, otp.Email, otp.Name)
+	if err != nil {
+		return models.User{}, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO password_accounts (user_id, email, password_hash) VALUES ($1, $2, $3)`, userID, otp.Email, otp.PasswordHash)
+	if err != nil {
+		return models.User{}, err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE email_otps SET consumed_at = NOW(), updated_at = NOW() WHERE id = $1`, otp.ID)
+	if err != nil {
+		return models.User{}, err
+	}
+
+	user, err := scanUser(tx.QueryRowContext(ctx, userSelectSQL()+` WHERE id = $1`, userID))
+	if err != nil {
+		return models.User{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return models.User{}, err
+	}
+	return user, nil
 }
 
 func (s *Store) CreatePasswordUser(ctx context.Context, email string, name string, passwordHash string) (models.User, error) {

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
@@ -28,6 +29,7 @@ import (
 	"be-miawai/internal/auth"
 	"be-miawai/internal/config"
 	"be-miawai/internal/database"
+	"be-miawai/internal/email"
 	"be-miawai/internal/models"
 	"be-miawai/internal/payment"
 	"be-miawai/internal/research"
@@ -46,6 +48,7 @@ type Server struct {
 	aiClient        *ai.Client
 	research        *research.Client
 	chatStorage     storage.CloudStorage
+	emailClient     *email.ResendClient
 	memoryWorkerMu  sync.Mutex
 	chatGuardMu     sync.Mutex
 	lastChatByUser  map[string]time.Time
@@ -76,7 +79,13 @@ func NewServer(cfg config.Config, store *database.Store) *Server {
 			TargetPages:     cfg.WebResearchTargetPages,
 			MaxContentChars: cfg.WebResearchMaxContentChars,
 		}),
-		chatStorage:    storage.NewLocalCloudStorage("storage/chats"),
+		chatStorage: storage.NewLocalCloudStorage("storage/chats"),
+		emailClient: email.NewResendClient(email.ResendConfig{
+			APIKey:    cfg.ResendAPIKey,
+			FromEmail: cfg.ResendFromEmail,
+			FromName:  cfg.ResendFromName,
+			Enabled:   cfg.ResendEnabled,
+		}),
 		lastChatByUser: make(map[string]time.Time),
 	}
 	server.startMemoryExtractionWorker()
@@ -94,6 +103,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/guest/session", s.guestSession)
 	mux.HandleFunc("POST /v1/guest/chat/stream", s.guestChatStream)
 	mux.HandleFunc("POST /v1/auth/register", s.register)
+	mux.HandleFunc("POST /v1/auth/register/verify", s.verifyRegisterOTP)
 	mux.HandleFunc("POST /v1/auth/login", s.passwordLogin)
 	mux.HandleFunc("POST /v1/auth/dev-login", s.devLogin)
 	mux.HandleFunc("GET /v1/auth/google/login", s.oauthLogin("google"))
@@ -338,15 +348,87 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := s.store.CreatePasswordUser(r.Context(), email, name, string(hash))
+	if !s.cfg.EmailOTPEnabled {
+		user, err := s.store.CreatePasswordUser(r.Context(), email, name, string(hash))
+		if errors.Is(err, database.ErrEmailAlreadyExists) {
+			writeError(w, http.StatusConflict, "email already registered")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to register account")
+			return
+		}
+		s.writeUserSession(w, decorateUserAccess(user))
+		return
+	}
+
+	if s.emailClient == nil || !s.emailClient.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "email otp provider is not configured")
+		return
+	}
+
+	otp, err := generateRegisterOTP()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate otp")
+		return
+	}
+	ttl := time.Duration(s.cfg.EmailOTPTTLMin) * time.Minute
+	_, err = s.store.CreateEmailOTP(r.Context(), email, name, string(hash), hashRegisterOTP(s.cfg.SessionSecret, email, otp), ttl)
 	if errors.Is(err, database.ErrEmailAlreadyExists) {
 		writeError(w, http.StatusConflict, "email already registered")
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to register account")
+		writeError(w, http.StatusInternalServerError, "failed to prepare otp")
 		return
 	}
+	if err := s.emailClient.SendOTP(r.Context(), email, otp); err != nil {
+		log.Printf("send register otp failed email=%s err=%v", email, err)
+		writeError(w, http.StatusBadGateway, "failed to send otp email")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status": "otp_required",
+		"email":  email,
+	})
+}
+
+func (s *Server) verifyRegisterOTP(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Email string `json:"email"`
+		OTP   string `json:"otp"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+
+	email := normalizeEmail(body.Email)
+	otp := strings.TrimSpace(body.OTP)
+	if email == "" || !strings.Contains(email, "@") {
+		writeError(w, http.StatusBadRequest, "valid email is required")
+		return
+	}
+	if len(otp) != 6 {
+		writeError(w, http.StatusBadRequest, "valid otp is required")
+		return
+	}
+
+	user, err := s.store.ConsumeEmailOTP(r.Context(), email, hashRegisterOTP(s.cfg.SessionSecret, email, otp), 5)
+	if errors.Is(err, database.ErrEmailOTPInvalid) {
+		writeError(w, http.StatusUnauthorized, "invalid or expired otp")
+		return
+	}
+	if errors.Is(err, database.ErrEmailAlreadyExists) {
+		writeError(w, http.StatusConflict, "email already registered")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to verify otp")
+		return
+	}
+
 	s.writeUserSession(w, decorateUserAccess(user))
 }
 
@@ -375,6 +457,23 @@ func (s *Server) passwordLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeUserSession(w, decorateUserAccess(account.User))
+}
+
+func hashRegisterOTP(secret string, email string, otp string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(normalizeEmail(email)))
+	mac.Write([]byte(":"))
+	mac.Write([]byte(strings.TrimSpace(otp)))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func generateRegisterOTP() (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	value := (int(b[0])<<24 | int(b[1])<<16 | int(b[2])<<8 | int(b[3])) & 0x7fffffff
+	return fmt.Sprintf("%06d", value%1000000), nil
 }
 
 func (s *Server) writeUserSession(w http.ResponseWriter, user models.User) {
