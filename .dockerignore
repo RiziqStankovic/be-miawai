@@ -1,0 +1,14 @@
+.git
+.env
+.gitignore
+Dockerfile
+README.md
+bin/
+data/
+storage/
+searxng/
+
+*.md
+*.log
+
+.github/

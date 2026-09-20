@@ -15,15 +15,29 @@ Go API for Miaw AI web, desktop, and Android entitlement handling.
 
 ## Run locally
 
-```powershell
+```bash
 docker compose up -d
-go mod tidy
+
+go mod download
 go run ./cmd/api
 ```
 
-The API auto-runs every `.sql` file in `migrations/` during startup, so tables are created on first boot.
+The API auto-runs every `.sql` file in `migrations/` during startup, so tables are created on first boot. The current Compose file provides SearXNG and Lightpanda only; provide PostgreSQL separately and set `DATABASE_URL` before starting the API.
 
 Copy `.env.example` to `.env` or export the same variables before running. The default runtime settings can reuse the same `THUKI_*` variables used by `miaw-ai-chat-windows`.
+
+## CI/CD
+
+GitHub Actions is defined in `.github/workflows/docker.yml`, following the Docker build/push pattern used by `cloudfren-core`. Pushes to `master`, version tags (`v*`), and manual runs build and push the `linux/amd64` image `ziq02/be-miawai` with branch, semver, commit-SHA, and `latest` tags.
+
+Configure these GitHub Actions repository secrets before running the workflow:
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+
+The workflow does not contain registry credentials in source code. No deploy workflow is included because the deployment target is managed separately through GitOps.
+
+The image expects runtime configuration through environment variables, especially `DATABASE_URL`, `SESSION_SECRET`, `SUBSCRIPTION_WEBHOOK_SECRET`, and any provider credentials. Configure these in the runtime secret manager, not in the repository or image. For production, disable development auth, enable secure cookies, and provide a strong admin bootstrap password only if bootstrap is intentionally enabled. The image includes `migrations/` and starts as a non-root user.
 
 ## Web research
 
