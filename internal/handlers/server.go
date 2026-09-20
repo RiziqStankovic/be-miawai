@@ -691,6 +691,12 @@ func (s *Server) oauthCallback(provider string) http.HandlerFunc {
 			return
 		}
 
+		if providerError := r.URL.Query().Get("error"); providerError != "" {
+			logOAuthFailure(provider, "authorization", 0, providerError, r.URL.Query().Get("error_description"))
+			writeError(w, http.StatusBadGateway, "oauth provider rejected login")
+			return
+		}
+
 		code := r.URL.Query().Get("code")
 		if code == "" {
 			writeError(w, http.StatusBadRequest, "missing oauth code")
@@ -699,7 +705,7 @@ func (s *Server) oauthCallback(provider string) http.HandlerFunc {
 
 		profile, err := s.exchangeOAuthCode(r.Context(), provider, code)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeError(w, http.StatusBadGateway, "oauth provider exchange failed")
 			return
 		}
 
@@ -957,7 +963,7 @@ func (s *Server) tokenExchange(w http.ResponseWriter, r *http.Request) {
 
 	profile, err := s.exchangeOAuthCode(r.Context(), body.Provider, body.Code)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeError(w, http.StatusBadGateway, "oauth provider exchange failed")
 		return
 	}
 
@@ -2515,10 +2521,54 @@ func (s *Server) buildAuthURL(provider string, state string) (string, error) {
 	}
 }
 
+type oauthProviderError struct {
+	provider         string
+	endpointClass    string
+	status           int
+	errorCode        string
+	errorDescription string
+	errorURI         string
+	cause            error
+}
+
+func (e *oauthProviderError) Error() string {
+	if e.cause != nil {
+		return fmt.Sprintf("%s oauth %s request failed: %v", e.provider, e.endpointClass, e.cause)
+	}
+	return fmt.Sprintf("%s oauth %s request failed with status %d", e.provider, e.endpointClass, e.status)
+}
+
+func (e *oauthProviderError) Unwrap() error {
+	return e.cause
+}
+
+func logOAuthFailure(provider string, endpointClass string, status int, errorCode string, errorDescription string, sensitive ...string) {
+	description := sanitizeOAuthField(errorDescription)
+	for _, value := range sensitive {
+		if value = strings.TrimSpace(value); value != "" {
+			description = strings.ReplaceAll(description, value, "[REDACTED]")
+		}
+	}
+	log.Printf("oauth provider=%s endpoint_class=%s status=%d error_code=%q error_description=%q", provider, endpointClass, status, sanitizeOAuthField(errorCode), description)
+}
+
+func sanitizeOAuthField(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 256 {
+		value = value[:256]
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, value)
+}
+
 func (s *Server) exchangeOAuthCode(ctx context.Context, provider string, code string) (models.OAuthProfile, error) {
 	switch provider {
 	case "google":
-		token, err := s.exchangeToken(ctx, "https://oauth2.googleapis.com/token", url.Values{
+		token, err := s.exchangeToken(ctx, "https://oauth2.googleapis.com/token", "google", "token_exchange", url.Values{
 			"client_id":     {s.cfg.GoogleClientID},
 			"client_secret": {s.cfg.GoogleClientSecret},
 			"code":          {code},
@@ -2526,7 +2576,7 @@ func (s *Server) exchangeOAuthCode(ctx context.Context, provider string, code st
 			"redirect_uri":  {s.cfg.APIBaseURL + "/v1/auth/google/callback"},
 		})
 		if err != nil {
-			return models.OAuthProfile{}, err
+			return models.OAuthProfile{}, fmt.Errorf("exchange google oauth code: %w", err)
 		}
 		var profile struct {
 			Sub     string `json:"sub"`
@@ -2534,8 +2584,8 @@ func (s *Server) exchangeOAuthCode(ctx context.Context, provider string, code st
 			Name    string `json:"name"`
 			Picture string `json:"picture"`
 		}
-		if err := s.getJSON(ctx, "https://www.googleapis.com/oauth2/v3/userinfo", token, &profile); err != nil {
-			return models.OAuthProfile{}, err
+		if err := s.getJSON(ctx, "https://www.googleapis.com/oauth2/v3/userinfo", "google", "userinfo", token, &profile); err != nil {
+			return models.OAuthProfile{}, fmt.Errorf("retrieve google oauth profile: %w", err)
 		}
 		return models.OAuthProfile{
 			Provider:       "google",
@@ -2545,14 +2595,14 @@ func (s *Server) exchangeOAuthCode(ctx context.Context, provider string, code st
 			AvatarURL:      profile.Picture,
 		}, nil
 	case "github":
-		token, err := s.exchangeToken(ctx, "https://github.com/login/oauth/access_token", url.Values{
+		token, err := s.exchangeToken(ctx, "https://github.com/login/oauth/access_token", "github", "token_exchange", url.Values{
 			"client_id":     {s.cfg.GitHubClientID},
 			"client_secret": {s.cfg.GitHubClientSecret},
 			"code":          {code},
 			"redirect_uri":  {s.cfg.APIBaseURL + "/v1/auth/github/callback"},
 		})
 		if err != nil {
-			return models.OAuthProfile{}, err
+			return models.OAuthProfile{}, fmt.Errorf("exchange github oauth code: %w", err)
 		}
 		var profile struct {
 			ID        int64  `json:"id"`
@@ -2561,8 +2611,8 @@ func (s *Server) exchangeOAuthCode(ctx context.Context, provider string, code st
 			Login     string `json:"login"`
 			AvatarURL string `json:"avatar_url"`
 		}
-		if err := s.getJSON(ctx, "https://api.github.com/user", token, &profile); err != nil {
-			return models.OAuthProfile{}, err
+		if err := s.getJSON(ctx, "https://api.github.com/user", "github", "userinfo", token, &profile); err != nil {
+			return models.OAuthProfile{}, fmt.Errorf("retrieve github oauth profile: %w", err)
 		}
 		email := profile.Email
 		if email == "" {
@@ -2584,53 +2634,83 @@ func (s *Server) exchangeOAuthCode(ctx context.Context, provider string, code st
 	}
 }
 
-func (s *Server) exchangeToken(ctx context.Context, endpoint string, values url.Values) (string, error) {
+func (s *Server) exchangeToken(ctx context.Context, endpoint string, provider string, endpointClass string, values url.Values) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(values.Encode()))
 	if err != nil {
-		return "", err
+		return "", &oauthProviderError{provider: provider, endpointClass: endpointClass, cause: err}
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return "", err
+		logOAuthFailure(provider, endpointClass, 0, "", "network failure")
+		return "", &oauthProviderError{provider: provider, endpointClass: endpointClass, cause: err}
 	}
 	defer resp.Body.Close()
 
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		logOAuthFailure(provider, endpointClass, resp.StatusCode, "", "response read failure")
+		return "", &oauthProviderError{provider: provider, endpointClass: endpointClass, status: resp.StatusCode, cause: err}
+	}
 	var body struct {
-		AccessToken string `json:"access_token"`
-		Error       string `json:"error"`
+		AccessToken      string `json:"access_token"`
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+		ErrorURI         string `json:"error_uri"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", err
+	if err := json.Unmarshal(bodyBytes, &body); err != nil {
+		logOAuthFailure(provider, endpointClass, resp.StatusCode, "invalid_response", "non-json provider response")
+		return "", &oauthProviderError{provider: provider, endpointClass: endpointClass, status: resp.StatusCode, errorCode: "invalid_response", cause: err}
 	}
-	if resp.StatusCode >= 300 || body.AccessToken == "" {
-		if body.Error == "" {
-			body.Error = "oauth token exchange failed"
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || body.AccessToken == "" {
+		logOAuthFailure(provider, endpointClass, resp.StatusCode, body.Error, body.ErrorDescription, values.Get("code"), values.Get("client_secret"))
+		return "", &oauthProviderError{
+			provider: provider, endpointClass: endpointClass, status: resp.StatusCode,
+			errorCode: sanitizeOAuthField(body.Error), errorDescription: sanitizeOAuthField(body.ErrorDescription), errorURI: sanitizeOAuthField(body.ErrorURI),
 		}
-		return "", errors.New(body.Error)
 	}
 	return body.AccessToken, nil
 }
 
-func (s *Server) getJSON(ctx context.Context, endpoint string, token string, out any) error {
+func (s *Server) getJSON(ctx context.Context, endpoint string, provider string, endpointClass string, token string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return err
+		return &oauthProviderError{provider: provider, endpointClass: endpointClass, cause: err}
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return err
+		logOAuthFailure(provider, endpointClass, 0, "", "network failure")
+		return &oauthProviderError{provider: provider, endpointClass: endpointClass, cause: err}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("oauth profile request failed with %d", resp.StatusCode)
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		logOAuthFailure(provider, endpointClass, resp.StatusCode, "", "response read failure")
+		return &oauthProviderError{provider: provider, endpointClass: endpointClass, status: resp.StatusCode, cause: err}
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var body struct {
+			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
+			ErrorURI         string `json:"error_uri"`
+		}
+		if json.Unmarshal(bodyBytes, &body) == nil {
+			logOAuthFailure(provider, endpointClass, resp.StatusCode, body.Error, body.ErrorDescription, token)
+		} else {
+			logOAuthFailure(provider, endpointClass, resp.StatusCode, "invalid_response", "non-json provider response")
+		}
+		return &oauthProviderError{provider: provider, endpointClass: endpointClass, status: resp.StatusCode, errorCode: sanitizeOAuthField(body.Error), errorDescription: sanitizeOAuthField(body.ErrorDescription), errorURI: sanitizeOAuthField(body.ErrorURI)}
+	}
+	if err := json.Unmarshal(bodyBytes, out); err != nil {
+		logOAuthFailure(provider, endpointClass, resp.StatusCode, "invalid_response", "invalid provider response")
+		return &oauthProviderError{provider: provider, endpointClass: endpointClass, status: resp.StatusCode, errorCode: "invalid_response", cause: err}
+	}
+	return nil
 }
 
 func validSignature(secret string, payload []byte, signature string) bool {
