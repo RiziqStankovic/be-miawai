@@ -41,6 +41,11 @@ type Config struct {
 
 const maxInboundMessageAge = 5 * time.Minute
 
+const (
+	connectAttempts   = 5
+	connectRetryDelay = time.Second
+)
+
 type Runner struct {
 	cfg     Config
 	backend Backend
@@ -111,7 +116,7 @@ func (r *Runner) startLocked(ctx context.Context) error {
 		go r.handleQR(ctx, qrChan)
 	}
 
-	if err := client.Connect(); err != nil {
+	if err := connectWhatsApp(client.Connect, time.Sleep); err != nil {
 		return err
 	}
 	r.reportStatus(context.Background(), "connected")
@@ -211,6 +216,19 @@ func removeWhatsAppSessionDB(path string) error {
 
 func sqliteDSN(path string) string {
 	return "file:" + filepath.ToSlash(path) + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+}
+
+func connectWhatsApp(connect func() error, sleep func(time.Duration)) error {
+	var err error
+	for attempt := 1; attempt <= connectAttempts; attempt++ {
+		if err = connect(); err == nil {
+			return nil
+		}
+		if attempt < connectAttempts {
+			sleep(connectRetryDelay)
+		}
+	}
+	return err
 }
 
 func (r *Runner) handleQR(ctx context.Context, qrChan <-chan whatsmeow.QRChannelItem) {
