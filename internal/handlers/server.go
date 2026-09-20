@@ -173,9 +173,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/knowledge/{name}/upload", s.requireUser(s.dtUploadKnowledgeFiles))
 	mux.HandleFunc("POST /api/v1/knowledge/{name}/folders", s.requireUser(s.dtCreateKnowledgeFolder))
 	mux.HandleFunc("POST /api/v1/knowledge/{name}/files/move", s.requireUser(s.dtMoveKnowledgeFile))
-	mux.HandleFunc("GET /api/v1/knowledge/{name}/files/{filename...}", s.requireUser(s.dtGetKnowledgeFile))
-	mux.HandleFunc("DELETE /api/v1/knowledge/{name}/files/{filename...}", s.requireUser(s.dtDeleteKnowledgeFile))
-	mux.HandleFunc("GET /api/v1/knowledge/{name}/file-preview-text/{filename...}", s.requireUser(s.dtGetKnowledgePreview))
+	mux.HandleFunc("/api/v1/knowledge/", s.requireUser(s.knowledgeFileRoute))
 	mux.HandleFunc("PUT /api/v1/knowledge/default/{name}", s.requireUser(s.dtSetDefaultKnowledgeBase))
 	mux.HandleFunc("POST /api/v1/knowledge/{name}/reindex", s.requireUser(s.dtReindexKnowledgeBase))
 	mux.HandleFunc("POST /api/v1/knowledge/{name}/retry", s.requireUser(s.dtRetryKnowledgeBase))
@@ -350,6 +348,40 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/subscriptions/verify-android", s.requireUser(s.verifyAndroidPurchase))
 	mux.HandleFunc("/v1/{path...}", s.openAIUnsupportedGateway)
 	return s.withRequestLogging(mux)
+}
+
+func (s *Server) knowledgeFileRoute(w http.ResponseWriter, r *http.Request, user models.User) {
+	path := r.URL.Path
+	prefix := "/api/v1/knowledge/"
+	remainder := strings.TrimPrefix(path, prefix)
+	parts := strings.SplitN(remainder, "/", 2)
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+
+	name := parts[0]
+	filePath := parts[1]
+	r.SetPathValue("name", name)
+
+	if strings.HasPrefix(filePath, "file-preview-text/") && r.Method == http.MethodGet {
+		r.SetPathValue("filename", strings.TrimPrefix(filePath, "file-preview-text/"))
+		s.dtGetKnowledgePreview(w, r, user)
+		return
+	}
+	if strings.HasPrefix(filePath, "files/") {
+		r.SetPathValue("filename", strings.TrimPrefix(filePath, "files/"))
+		switch r.Method {
+		case http.MethodGet:
+			s.dtGetKnowledgeFile(w, r, user)
+		case http.MethodDelete:
+			s.dtDeleteKnowledgeFile(w, r, user)
+		default:
+			http.NotFound(w, r)
+		}
+		return
+	}
+	http.NotFound(w, r)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
