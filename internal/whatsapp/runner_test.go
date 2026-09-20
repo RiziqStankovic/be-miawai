@@ -1,6 +1,7 @@
 package whatsapp
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -29,6 +30,25 @@ func TestConnectWhatsAppRetriesTransientFailures(t *testing.T) {
 	}
 	if sleeps != 2 {
 		t.Fatalf("retry sleeps = %d, want 2", sleeps)
+	}
+}
+
+func TestConnectWhatsAppStopsWhenContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+	errExpected := errors.New("tls handshake failure")
+
+	err := connectWhatsAppContext(ctx, func() error {
+		attempts++
+		cancel()
+		return errExpected
+	})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("connectWhatsAppContext() error = %v, want context canceled", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("connect attempts = %d, want 1", attempts)
 	}
 }
 

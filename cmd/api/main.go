@@ -52,7 +52,7 @@ func main() {
 	}, api)
 	api.SetWhatsAppPairingRefresher(waRunner.RefreshPairing)
 	if err := waRunner.Start(ctx); err != nil {
-		log.Fatalf("start whatsapp: %v", err)
+		log.Printf("start whatsapp: %v", err)
 	}
 
 	server := &http.Server{

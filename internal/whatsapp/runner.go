@@ -44,6 +44,8 @@ const maxInboundMessageAge = 5 * time.Minute
 const (
 	connectAttempts   = 5
 	connectRetryDelay = time.Second
+	connectMaxDelay   = 30 * time.Second
+	restartRetryDelay = 5 * time.Second
 )
 
 type Runner struct {
@@ -56,6 +58,10 @@ type Runner struct {
 
 	healthMu      sync.Mutex
 	healthCancel  context.CancelFunc
+	runCtx        context.Context
+	runCancel     context.CancelFunc
+	retryWG       sync.WaitGroup
+	replyWG       sync.WaitGroup
 	lastEventAt   time.Time
 	lastMessageAt time.Time
 	lastStatus    string
@@ -68,7 +74,14 @@ func NewRunner(cfg Config, backend Backend) *Runner {
 func (r *Runner) Start(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.startLocked(context.Background())
+	if !r.cfg.Enabled {
+		log.Printf("whatsapp embedded disabled")
+		return nil
+	}
+	if r.client != nil || r.runCancel != nil {
+		return nil
+	}
+	return r.startLocked(ctx)
 }
 
 func (r *Runner) startLocked(ctx context.Context) error {
@@ -79,7 +92,23 @@ func (r *Runner) startLocked(ctx context.Context) error {
 	if r.backend == nil {
 		return errors.New("whatsapp backend is required")
 	}
-	account, err := r.backend.GetOrCreateCentralWhatsAppAccount(ctx)
+	runCtx, cancel := context.WithCancel(ctx)
+	cleanup := true
+	defer func() {
+		if cleanup {
+			cancel()
+			if r.client != nil {
+				r.client.Disconnect()
+				r.client = nil
+			}
+			if r.db != nil {
+				_ = r.db.Close()
+				r.db = nil
+			}
+		}
+	}()
+
+	account, err := r.backend.GetOrCreateCentralWhatsAppAccount(runCtx)
 	if err != nil {
 		return err
 	}
@@ -96,10 +125,10 @@ func (r *Runner) startLocked(ctx context.Context) error {
 	r.db = db
 
 	container := sqlstore.NewWithDB(db, "sqlite3", waLog.Stdout("WhatsAppDB", "WARN", true))
-	if err := container.Upgrade(ctx); err != nil {
+	if err := container.Upgrade(runCtx); err != nil {
 		return err
 	}
-	device, err := container.GetFirstDevice(ctx)
+	device, err := container.GetFirstDevice(runCtx)
 	if err != nil {
 		return err
 	}
@@ -109,21 +138,35 @@ func (r *Runner) startLocked(ctx context.Context) error {
 	client.AddEventHandler(r.handleEvent)
 
 	if client.Store.ID == nil {
-		qrChan, err := client.GetQRChannel(ctx)
+		qrChan, err := client.GetQRChannel(runCtx)
 		if err != nil {
 			return err
 		}
-		go r.handleQR(ctx, qrChan)
+		r.retryWG.Add(1)
+		go func() {
+			defer r.retryWG.Done()
+			r.handleQR(runCtx, qrChan)
+		}()
 	}
 
-	if err := connectWhatsApp(client.Connect, time.Sleep); err != nil {
-		return err
+	r.runCtx = runCtx
+	r.runCancel = cancel
+	if err := connectWhatsAppContext(runCtx, client.Connect); err != nil {
+		log.Printf("whatsapp connection failed; retrying in background: %v", err)
+		r.reportStatus(runCtx, "disconnected")
+		r.startReconnectLoop()
+	} else {
+		r.reportStatus(runCtx, "connected")
+		r.markHealth("connected", false)
 	}
-	r.reportStatus(context.Background(), "connected")
-	r.markHealth("connected", false)
-	healthCtx, cancel := context.WithCancel(ctx)
-	r.healthCancel = cancel
-	go r.healthLoop(healthCtx)
+	healthCtx, healthCancel := context.WithCancel(runCtx)
+	r.healthCancel = healthCancel
+	r.retryWG.Add(1)
+	go func() {
+		defer r.retryWG.Done()
+		r.healthLoop(healthCtx)
+	}()
+	cleanup = false
 	log.Printf("miaw wa embedded running account=%s listen_groups=%t", r.account.ID, r.cfg.ListenGroups)
 	return nil
 }
@@ -131,6 +174,9 @@ func (r *Runner) startLocked(ctx context.Context) error {
 func (r *Runner) Stop(ctx context.Context) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.runCancel == nil && r.client == nil && r.db == nil {
+		return
+	}
 	r.stopLocked(ctx)
 }
 
@@ -139,11 +185,27 @@ func (r *Runner) stopLocked(ctx context.Context) {
 		r.healthCancel()
 		r.healthCancel = nil
 	}
+	if r.runCancel != nil {
+		r.runCancel()
+		r.runCancel = nil
+		r.runCtx = nil
+	}
 	if r.client != nil {
 		r.client.Disconnect()
 		r.reportStatus(ctx, "disconnected")
 		r.markHealth("disconnected", false)
 		r.client = nil
+	}
+	waitDone := make(chan struct{})
+	go func() {
+		r.retryWG.Wait()
+		r.replyWG.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-ctx.Done():
+		log.Printf("whatsapp shutdown timed out: %v", ctx.Err())
 	}
 	if r.db != nil {
 		if err := r.db.Close(); err != nil {
@@ -151,6 +213,31 @@ func (r *Runner) stopLocked(ctx context.Context) {
 		}
 		r.db = nil
 	}
+}
+
+func (r *Runner) startReconnectLoop() {
+	r.retryWG.Add(1)
+	go func() {
+		defer r.retryWG.Done()
+		ctx := r.runCtx
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(restartRetryDelay):
+			}
+			if r.client == nil {
+				return
+			}
+			if err := connectWhatsAppContext(ctx, r.client.Connect); err == nil {
+				r.reportStatus(ctx, "connected")
+				r.markHealth("connected", false)
+				return
+			} else {
+				log.Printf("whatsapp background reconnect failed: %v", err)
+			}
+		}
+	}()
 }
 
 func (r *Runner) RefreshPairing(ctx context.Context, accountID string) error {
@@ -231,19 +318,56 @@ func connectWhatsApp(connect func() error, sleep func(time.Duration)) error {
 	return err
 }
 
+func connectWhatsAppContext(ctx context.Context, connect func() error) error {
+	var err error
+	for attempt := 1; attempt <= connectAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if err = connect(); err == nil {
+			return nil
+		}
+		if attempt == connectAttempts {
+			break
+		}
+		delay := connectRetryDelay * time.Duration(1<<(attempt-1))
+		if delay > connectMaxDelay {
+			delay = connectMaxDelay
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
+	return err
+}
+
 func (r *Runner) handleQR(ctx context.Context, qrChan <-chan whatsmeow.QRChannelItem) {
-	for evt := range qrChan {
-		if evt.Event == "code" {
-			qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			r.reportQRCode(ctx, evt.Code)
-			continue
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt, ok := <-qrChan:
+			if !ok {
+				return
+			}
+			if evt.Event == "code" {
+				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				r.reportQRCode(ctx, evt.Code)
+				continue
+			}
+			if evt.Event == "success" {
+				r.reportStatus(ctx, "connected")
+			} else if evt.Event == "timeout" {
+				r.reportStatus(ctx, "pending_qr")
+			}
+			log.Printf("whatsapp qr event: %s", evt.Event)
 		}
-		if evt.Event == "success" {
-			r.reportStatus(ctx, "connected")
-		} else if evt.Event == "timeout" {
-			r.reportStatus(ctx, "pending_qr")
-		}
-		log.Printf("whatsapp qr event: %s", evt.Event)
 	}
 }
 
@@ -298,7 +422,17 @@ func (r *Runner) handleEvent(evt any) {
 		log.Printf("whatsapp message ignored account=%s id=%s reason=empty_text chat=%s", r.account.ID, msg.Info.ID, msg.Info.Chat)
 		return
 	}
-	go r.reply(context.Background(), msg, text)
+	r.mu.Lock()
+	r.replyWG.Add(1)
+	runCtx := r.runCtx
+	r.mu.Unlock()
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	go func() {
+		defer r.replyWG.Done()
+		r.reply(runCtx, msg, text)
+	}()
 }
 
 func (r *Runner) readyForInbound() bool {
@@ -451,7 +585,7 @@ func (r *Runner) reply(ctx context.Context, msg *events.Message, text string) {
 	sender := msg.Info.Sender
 	r.markMessageRead(ctx, msg)
 	r.setChatTyping(ctx, chat, true)
-	defer r.setChatTyping(context.Background(), chat, false)
+	defer r.setChatTyping(ctx, chat, false)
 
 	contact := chat.String()
 	backendContact := contact
